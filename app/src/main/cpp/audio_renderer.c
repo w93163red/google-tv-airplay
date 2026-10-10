@@ -29,6 +29,7 @@
 #define OFFSET_STALE_NS 500000000LL
 #define OFFSET_SMOOTHING 16 /* packets of exponential averaging for the video schedule */
 #define STALE_NS 120000000LL /* a packet this much later than usual is dropped; steady-state jitter stays under 105 ms */
+#define STALE_RUN_NS 5000000000LL /* longer than a backlog drains (3.4 s in the iPad recording): the path got slower */
 #define MAPPING_STEP_NS 1000000LL /* a sender-time step that differs from the RTP step by more is a new sync mapping */
 
 /* PCM at the stream rate between the network thread (sole writer) and the AAudio callback (sole
@@ -66,6 +67,7 @@ static struct {
      * played that late it would move the A/V offset by as much. Reset when a stream starts or flushes. */
     bool anchored;
     int64_t lateness_ns;        /* arrival minus sender time, averaged over played packets */
+    int64_t stale_since_ns;     /* first packet of the current run of stale ones, 0 outside a run */
     uint64_t last_ntp;          /* sender time and RTP time of the previous packet */
     uint32_t last_rtp;
     int latency_count;          /* out_latency_us samples since stats_start_us */
@@ -312,10 +314,11 @@ static void write_pcm_locked(const int16_t *pcm, int frames, uint64_t ntp_remote
  * it starts with) is not lateness: it moves the audio offset and the lateness average by the step at once. */
 static bool stale_locked(uint64_t ntp_remote, uint32_t rtp) {
     if (!ntp_remote) return false;
-    int64_t lateness = airscreen_now_ns() - (int64_t) ntp_remote;
+    int64_t now = airscreen_now_ns(), lateness = now - (int64_t) ntp_remote;
     if (!a.anchored) {
         a.anchored = true;
         a.lateness_ns = lateness;
+        a.stale_since_ns = 0;
     } else {
         int64_t step = (int64_t) (ntp_remote - a.last_ntp) - (int64_t) (int32_t) (rtp - a.last_rtp) * 1000000000LL / SAMPLE_RATE;
         if (llabs(step) > MAPPING_STEP_NS) {
@@ -327,9 +330,15 @@ static bool stale_locked(uint64_t ntp_remote, uint32_t rtp) {
     a.last_ntp = ntp_remote;
     a.last_rtp = rtp;
     if (lateness - a.lateness_ns > STALE_NS) {
-        a.stale++;
-        return true;
+        if (!a.stale_since_ns) a.stale_since_ns = now;
+        if (now - a.stale_since_ns < STALE_RUN_NS) {
+            a.stale++;
+            return true;
+        }
+        LOGI("audio %.0f ms late for %lld s, playing it", (lateness - a.lateness_ns) / 1e6, STALE_RUN_NS / 1000000000);
+        a.lateness_ns = lateness;
     }
+    a.stale_since_ns = 0;
     a.lateness_ns += (lateness - a.lateness_ns) / OFFSET_SMOOTHING;
     return false;
 }
