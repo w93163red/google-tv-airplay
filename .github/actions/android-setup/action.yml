@@ -1,0 +1,36 @@
+name: Android build setup
+description: JDK 17, the NDK and CMake versions app/build.gradle.kts names, and libcrypto from scripts/build-deps.sh.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+      with:
+        distribution: temurin
+        java-version: "17"
+        cache: gradle
+
+    - name: Install the NDK and CMake that app/build.gradle.kts names
+      shell: bash
+      run: |
+        ndk=$(sed -n 's/^ *ndkVersion = "\(.*\)"/\1/p' app/build.gradle.kts)
+        cmake=$(sed -n 's/^ *version = "\(.*\)"/\1/p' app/build.gradle.kts)
+        if [[ -z $ndk || -z $cmake ]]; then
+          echo "::error::cannot read ndkVersion or the CMake version from app/build.gradle.kts"
+          exit 1
+        fi
+        sdkmanager=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
+        (yes || true) | "$sdkmanager" --licenses >/dev/null
+        "$sdkmanager" --install "ndk;$ndk" "cmake;$cmake" >/dev/null
+        echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/$ndk" >>"$GITHUB_ENV"
+
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          third_party/.cache/*.tar.gz
+          third_party/prebuilt
+        key: deps-${{ runner.os }}-${{ hashFiles('scripts/build-deps.sh') }}
+
+    - name: Build libcrypto
+      shell: bash
+      run: scripts/build-deps.sh

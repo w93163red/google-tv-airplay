@@ -1,0 +1,99 @@
+name: Release
+
+# A pushed v* tag builds a release-signed APK and publishes it as a GitHub Release.
+# A manual run builds the same APK and uploads it as a workflow artifact, without a release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/android-setup
+
+      - name: Pick the version
+        id: version
+        run: |
+          if [[ $GITHUB_EVENT_NAME == push ]]; then
+            version=${GITHUB_REF_NAME#v}
+            echo "gradle_args=-PversionName=$version" >>"$GITHUB_OUTPUT"
+          else
+            version=dryrun-${GITHUB_SHA::7}
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Set up release signing
+        env:
+          AIRSCREEN_KEYSTORE_BASE64: ${{ secrets.AIRSCREEN_KEYSTORE_BASE64 }}
+          AIRSCREEN_KEYSTORE_PASSWORD: ${{ secrets.AIRSCREEN_KEYSTORE_PASSWORD }}
+          AIRSCREEN_KEY_ALIAS: ${{ secrets.AIRSCREEN_KEY_ALIAS }}
+          AIRSCREEN_KEY_PASSWORD: ${{ secrets.AIRSCREEN_KEY_PASSWORD }}
+        run: |
+          missing=()
+          for name in AIRSCREEN_KEYSTORE_BASE64 AIRSCREEN_KEYSTORE_PASSWORD AIRSCREEN_KEY_ALIAS AIRSCREEN_KEY_PASSWORD; do
+            [[ -n ${!name} ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            if [[ $GITHUB_EVENT_NAME == push ]]; then
+              echo "::error::a tag release needs the secrets ${missing[*]}"
+              exit 1
+            fi
+            echo "::warning::missing secrets ${missing[*]}, so this dry run is signed with the debug key"
+            exit 0
+          fi
+          keystore=$RUNNER_TEMP/release.keystore
+          base64 -d <<<"$AIRSCREEN_KEYSTORE_BASE64" >"$keystore"
+          {
+            echo "AIRSCREEN_KEYSTORE=$keystore"
+            echo "AIRSCREEN_KEYSTORE_PASSWORD=$AIRSCREEN_KEYSTORE_PASSWORD"
+            echo "AIRSCREEN_KEY_ALIAS=$AIRSCREEN_KEY_ALIAS"
+            echo "AIRSCREEN_KEY_PASSWORD=$AIRSCREEN_KEY_PASSWORD"
+          } >>"$GITHUB_ENV"
+
+      - name: Build
+        run: ./gradlew assembleRelease ${{ steps.version.outputs.gradle_args }}
+
+      - name: Check the signing certificate
+        run: |
+          apk=dist/airscreen-${{ steps.version.outputs.version }}.apk
+          mkdir -p dist
+          mv app/build/outputs/apk/release/app-release.apk "$apk"
+          apksigner=$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)
+          certs=$("$apksigner" verify --print-certs "$apk")
+          echo "$certs"
+          if [[ $GITHUB_EVENT_NAME == push ]] && grep -q "CN=Android Debug" <<<"$certs"; then
+            echo "::error::$apk is signed with the debug key"
+            exit 1
+          fi
+          echo "APK=$apk" >>"$GITHUB_ENV"
+
+      - name: Write the release notes
+        if: github.event_name == 'push'
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          git log --no-merges --pretty='- %s' ${previous:+"$previous.."}"$GITHUB_REF_NAME" >"$RUNNER_TEMP/notes.md"
+
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        if: github.event_name == 'push'
+        with:
+          files: ${{ env.APK }}
+          fail_on_unmatched_files: true
+          body_path: ${{ runner.temp }}/notes.md
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          name: airscreen-${{ steps.version.outputs.version }}
+          path: ${{ env.APK }}
+          if-no-files-found: error
