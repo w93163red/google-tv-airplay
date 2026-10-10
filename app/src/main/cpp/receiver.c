@@ -1,6 +1,7 @@
 #include <android/log.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -10,6 +11,7 @@
 
 #include "airscreen.h"
 #include "audio_renderer.h"
+#include "recording.h"
 #include "video_renderer.h"
 
 #define TAG "AirScreen"
@@ -34,6 +36,7 @@ static struct {
     int missed_feedback;
     float volume_db;
     char client[128];
+    char *files_dir;
 } r = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER };
 
 static void current_client(char *out, size_t len) {
@@ -51,8 +54,9 @@ static void request_reset(void) {
 
 static void conn_init(void *cls) {
     pthread_mutex_lock(&r.lock);
-    r.open_connections++;
+    bool first = r.open_connections++ == 0;
     pthread_mutex_unlock(&r.lock);
+    if (first) recorder_open(r.files_dir);
 }
 
 static void conn_destroy(void *cls) {
@@ -60,6 +64,7 @@ static void conn_destroy(void *cls) {
     bool last = --r.open_connections == 0;
     pthread_mutex_unlock(&r.lock);
     if (last) {
+        recorder_close();
         video_renderer_reset();
         audio_renderer_stop();
         bridge_emit(EVENT_DISCONNECTED, NULL, 0, 0);
@@ -88,19 +93,22 @@ static void report_client_request(void *cls, char *deviceid, char *model, char *
 static int video_set_codec(void *cls, video_codec_t codec) {
     char client[sizeof(r.client)];
     current_client(client, sizeof(client));
+    recorder_write(REC_VIDEO_CODEC, NULL, 0, 0, codec, 0);
     video_renderer_set_codec(codec);
     bridge_emit(EVENT_MIRROR_STARTED, client, codec, 0);
     return 0;
 }
 
 static void video_process(void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
-    video_renderer_push(data->data, data->data_len);
+    recorder_write(REC_VIDEO, data->data, (uint32_t) data->data_len, data->ntp_time_remote, 0, 0);
+    video_renderer_push(data->data, data->data_len, data->ntp_time_remote);
 }
 
 static void video_reset(void *cls, reset_type_t type) {
     if (type == RESET_TYPE_ON_VIDEO_PLAY) {
         return;
     }
+    recorder_write(REC_VIDEO_RESET, NULL, 0, 0, 0, 0);
     video_renderer_reset();
     bridge_emit(EVENT_MIRROR_STOPPED, NULL, 0, 0);
 }
@@ -114,6 +122,7 @@ static void video_resume(void *cls) {
 static void audio_get_format(void *cls, unsigned char *ct, unsigned short *spf, bool *using_screen,
                              bool *is_media, uint64_t *audio_format) {
     LOGI("audio format ct=%d spf=%d usingScreen=%d isMedia=%d", *ct, *spf, *using_screen, *is_media);
+    recorder_write(REC_AUDIO_FORMAT, NULL, 0, 0, *ct, *spf);
     audio_renderer_start(*ct, *spf);
     if (!*using_screen) {
         char client[sizeof(r.client)];
@@ -123,10 +132,12 @@ static void audio_get_format(void *cls, unsigned char *ct, unsigned short *spf, 
 }
 
 static void audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
-    audio_renderer_push(data->data, data->data_len);
+    recorder_write(REC_AUDIO, data->data, (uint32_t) data->data_len, data->ntp_time_remote, 0, 0);
+    audio_renderer_push(data->data, data->data_len, data->ntp_time_remote);
 }
 
 static void audio_flush(void *cls) {
+    recorder_write(REC_AUDIO_FLUSH, NULL, 0, 0, 0, 0);
     audio_renderer_flush();
 }
 
@@ -154,6 +165,7 @@ static void log_callback(void *cls, int level, const char *msg) {
 /* What UxPlay's main loop does after conn_reset: drop every connection and restart the httpd. */
 static void reset_connections(void) {
     raop_stop_httpd(r.raop);
+    recorder_close();
     audio_renderer_stop();
     video_renderer_reset();
     raop_remove_known_connections(r.raop);
@@ -192,7 +204,9 @@ static void *control_loop(void *arg) {
 
 int receiver_start(const receiver_config_t *cfg) {
     int err = 0;
-    video_renderer_init(cfg->width, cfg->height);
+    video_renderer_init(cfg);
+    free(r.files_dir);
+    r.files_dir = strdup(cfg->files_dir);
     r.dnssd = dnssd_init(cfg->name, (int) strlen(cfg->name), (const char *) cfg->hw_addr,
                          sizeof(cfg->hw_addr), 0, &err);
     if (!r.dnssd) {
@@ -292,6 +306,7 @@ void receiver_stop(void) {
         dnssd_destroy(r.dnssd);
         r.dnssd = NULL;
     }
+    recorder_close();
     video_renderer_reset();
     audio_renderer_stop();
 }

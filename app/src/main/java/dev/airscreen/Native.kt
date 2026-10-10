@@ -21,10 +21,12 @@ object Native {
         System.loadLibrary("airscreen")
     }
 
+    /** With [replay] set, plays that session recording through the renderers instead of serving AirPlay. */
     @JvmStatic
     external fun nativeStart(
         name: String, hwAddr: ByteArray, width: Int, height: Int,
         refreshHz: Int, maxFps: Int, h265: Boolean, keyfile: String,
+        filesDir: String, replay: String?,
     ): Int
 
     @JvmStatic

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 typedef struct {
     const char *name;
@@ -10,6 +11,8 @@ typedef struct {
     uint16_t width, height, refresh_hz, max_fps;
     bool h265;
     const char *keyfile;
+    const char *files_dir;  /* session recordings go here */
+    const char *replay;     /* non-NULL: replay this recording instead of serving AirPlay */
 } receiver_config_t;
 
 /* Ordinals are mirrored by NativeEvent.fromNative in Kotlin. */
@@ -21,6 +24,12 @@ typedef enum {
     EVENT_MIRROR_STOPPED = 4,
     EVENT_DISCONNECTED = 5,
 } native_event_t;
+
+static inline int64_t airscreen_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
 
 int receiver_start(const receiver_config_t *cfg);
 void receiver_stop(void);

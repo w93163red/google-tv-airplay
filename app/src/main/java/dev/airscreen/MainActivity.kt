@@ -2,6 +2,7 @@ package dev.airscreen
 
 import android.app.Activity
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.media.MediaCodecList
 import android.net.ConnectivityManager
@@ -92,7 +93,7 @@ class MainActivity : Activity(), Native.Sink {
         val (width, height, refresh, h265) = displayConfig()
         val result = Native.nativeStart(
             name, hwAddr(), width, height, refresh, min(refresh, 60), h265,
-            File(filesDir, "airplay.pem").path,
+            File(filesDir, "airplay.pem").path, filesDir.path, replayPath(),
         )
         if (result != 0) dispatch(NativeEvent.Failed("AirPlay 服务启动失败 ($result)"))
     }
@@ -156,6 +157,10 @@ class MainActivity : Activity(), Native.Sink {
         main.removeCallbacks(hideScaleHint)
         main.postDelayed(hideScaleHint, 1500)
     }
+
+    /** Debug builds only: `am start -S -n dev.airscreen/.MainActivity --es replay <recording>`. */
+    private fun replayPath(): String? =
+        intent.getStringExtra("replay")?.takeIf { applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 }
 
     private fun prefs() = getSharedPreferences("airscreen", Context.MODE_PRIVATE)
 

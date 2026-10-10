@@ -67,6 +67,7 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
 | `dnssd_android.c` | the dnssd private backend. Builds TXT records like UxPlay's mdnsd backend, forwards register and unregister to Kotlin |
 | `video_renderer.c` | AMediaCodec decoder on the `ANativeWindow`. H.264 and H.265, codec switch, low-latency config |
 | `audio_renderer.c` | AAC-ELD and AAC-LC through AMediaCodec, ALAC through Apple's decoder, PCM out through AAudio |
+| `recording.c` | the session recording file format, the recorder, and replay of a recording into the renderers |
 | `jni_bridge.c` | JNI entry points and the event upcall. Nothing else |
 
 ## Latency rules
@@ -81,3 +82,6 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
 
 1. Emulator: protocol and functional path. `scripts/emu-forward.sh` forwards the fixed ports into the emulator and registers a proxy mDNS record on the Mac.
 2. Streamer: latency, frame drops, 4K HEVC, 30-minute soak. Numbers come from decoder counters logged by the app, not from eyeballing.
+3. Record and replay. With `adb shell setprop debug.airscreen.record 1` set before a client connects, the receiver writes every access unit and audio packet it hands to the renderers, with its local arrival time and sender NTP time, to `files/rec-<epoch>.bin`. A debug build replays such a file through the same renderers, Surface and AAudio at the original pacing: `scripts/replay.sh <recording>` runs it and summarizes the `AirScreenStats` lines. `scripts/synth-recording.py` builds a synthetic recording when no real one exists.
+
+`AirScreenStats` prints once per second. Video: `decode_ms` is arrival to decoded, `glass_ms` is arrival to the render time handed to the surface (the MediaTek decoders never report actual render times), and `av_offset_ms` is when audio plays a sender timestamp minus when video renders it, positive when audio is late. Audio: `out_latency_ms` is from a write until its last frame plays, extrapolated from `AAudioStream_getTimestamp`, so it includes the HAL and Bluetooth path.

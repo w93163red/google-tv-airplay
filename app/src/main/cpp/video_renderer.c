@@ -5,10 +5,9 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
+#include "audio_renderer.h"
 #include "video_renderer.h"
-#include "airscreen.h"
 
 #define TAG "AirScreen"
 #define STATS_TAG "AirScreenStats"
@@ -19,13 +18,24 @@
 #define OUTPUT_TIMEOUT_US 10000
 #define MAX_SAMPLES 512
 
-/* Output thread only. */
+#define PENDING_SLOTS 256
+
 typedef struct {
-    int64_t window_start_us;
-    int rendered;
     int count;
-    int64_t latency_us[MAX_SAMPLES];
-} stats_t;
+    int64_t us[MAX_SAMPLES];
+} samples_t;
+
+/* One stats window. The MediaTek decoders never fire AMediaCodec's frame-rendered callback, so
+ * "presented" is the render time handed to the surface, which excludes SurfaceFlinger and the display. */
+static struct {
+    pthread_mutex_t lock;
+    struct { int64_t pts_us; uint64_t remote_ns; } pending[PENDING_SLOTS]; /* queued frames by pts */
+    int next_pending;
+    int rendered;     /* released to the surface */
+    samples_t decode; /* arrival to decoded */
+    samples_t glass;  /* arrival to presented */
+    samples_t av;     /* audio presentation minus video presentation of the same sender time */
+} t = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 /* The decoder exists exactly when codec, window and parameter sets are all known; reconcile() keeps it so. */
 static struct {
@@ -47,9 +57,7 @@ static struct {
 } v = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static int64_t now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return airscreen_now_ns() / 1000;
 }
 
 static int compare_i64(const void *a, const void *b) {
@@ -57,20 +65,62 @@ static int compare_i64(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-static void log_stats(stats_t *s, int64_t now) {
-    double p50 = 0, p99 = 0;
-    if (s->count) {
-        qsort(s->latency_us, s->count, sizeof(int64_t), compare_i64);
-        p50 = s->latency_us[s->count / 2] / 1000.0;
-        p99 = s->latency_us[(s->count * 99) / 100] / 1000.0;
+static void add_sample(samples_t *s, int64_t us) {
+    if (s->count < MAX_SAMPLES) s->us[s->count++] = us;
+}
+
+/* Sorts in place. */
+static double percentile_ms(samples_t *s, int pct) {
+    if (!s->count) return 0;
+    qsort(s->us, s->count, sizeof(int64_t), compare_i64);
+    return s->us[(s->count * pct) / 100] / 1000.0;
+}
+
+static void remember_frame(int64_t pts_us, uint64_t remote_ns) {
+    pthread_mutex_lock(&t.lock);
+    t.pending[t.next_pending].pts_us = pts_us;
+    t.pending[t.next_pending].remote_ns = remote_ns;
+    t.next_pending = (t.next_pending + 1) % PENDING_SLOTS;
+    pthread_mutex_unlock(&t.lock);
+}
+
+static uint64_t frame_remote_locked(int64_t pts_us) {
+    for (int i = 0; i < PENDING_SLOTS; i++) {
+        if (t.pending[i].pts_us == pts_us) return t.pending[i].remote_ns;
     }
+    return 0;
+}
+
+/* pts_us is the frame's local arrival time. */
+static void note_presented(int64_t pts_us, int64_t decoded_us, int64_t presented_ns) {
+    int64_t audio_offset;
+    pthread_mutex_lock(&t.lock);
+    t.rendered++;
+    add_sample(&t.decode, decoded_us - pts_us);
+    add_sample(&t.glass, presented_ns / 1000 - pts_us);
+    uint64_t remote = frame_remote_locked(pts_us);
+    if (remote && audio_renderer_offset(&audio_offset)) {
+        add_sample(&t.av, ((int64_t) remote + audio_offset - presented_ns) / 1000);
+    }
+    pthread_mutex_unlock(&t.lock);
+}
+
+static void log_stats(void) {
+    pthread_mutex_lock(&t.lock);
+    int rendered = t.rendered;
+    samples_t decode = t.decode, glass = t.glass, av = t.av;
+    t.rendered = 0;
+    t.decode.count = t.glass.count = t.av.count = 0;
+    pthread_mutex_unlock(&t.lock);
+    double av_p50 = percentile_ms(&av, 50);
+    for (int i = 0; i < av.count; i++) av.us[i] = llabs(av.us[i]);
     __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
-                        "in=%d rendered=%d dropped=%d decode_ms p50=%.1f p99=%.1f",
-                        atomic_exchange(&v.frames_in, 0), s->rendered,
-                        atomic_exchange(&v.frames_dropped, 0), p50, p99);
-    s->window_start_us = now;
-    s->rendered = 0;
-    s->count = 0;
+                        "in=%d rendered=%d dropped=%d decode_ms p50=%.1f p99=%.1f "
+                        "glass_ms p50=%.1f p99=%.1f av_offset_ms n=%d p50=%.1f abs_p99=%.1f",
+                        atomic_exchange(&v.frames_in, 0), rendered, atomic_exchange(&v.frames_dropped, 0),
+                        percentile_ms(&decode, 50), percentile_ms(&decode, 99),
+                        percentile_ms(&glass, 50), percentile_ms(&glass, 99),
+                        av.count, av_p50, percentile_ms(&av, 99));
 }
 
 static void report_size(AMediaCodec *decoder) {
@@ -90,24 +140,21 @@ static void report_size(AMediaCodec *decoder) {
 /* Releases every frame to the surface the moment it is decoded. Never takes v.lock. */
 static void *output_loop(void *arg) {
     AMediaCodec *decoder = arg;
-    stats_t stats = { .window_start_us = now_us() };
+    int64_t window_start = now_us();
     while (atomic_load(&v.output_running)) {
         AMediaCodecBufferInfo info;
         ssize_t index = AMediaCodec_dequeueOutputBuffer(decoder, &info, OUTPUT_TIMEOUT_US);
         int64_t now = now_us();
         if (index >= 0) {
-            AMediaCodec_releaseOutputBuffer(decoder, index, info.size > 0);
-            if (info.size > 0) {
-                stats.rendered++;
-                if (stats.count < MAX_SAMPLES) {
-                    stats.latency_us[stats.count++] = now - info.presentationTimeUs;
-                }
-            }
+            bool render = info.size > 0;
+            AMediaCodec_releaseOutputBuffer(decoder, index, render);
+            if (render) note_presented(info.presentationTimeUs, now, now * 1000);
         } else if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             report_size(decoder);
         }
-        if (now - stats.window_start_us >= 1000000) {
-            log_stats(&stats, now);
+        if (now - window_start >= 1000000) {
+            log_stats();
+            window_start = now;
         }
     }
     return NULL;
@@ -213,10 +260,10 @@ static bool capture_params_locked(const uint8_t *data, int len) {
     return true;
 }
 
-void video_renderer_init(uint16_t max_width, uint16_t max_height) {
+void video_renderer_init(const receiver_config_t *cfg) {
     pthread_mutex_lock(&v.lock);
-    v.max_width = max_width;
-    v.max_height = max_height;
+    v.max_width = cfg->width;
+    v.max_height = cfg->height;
     pthread_mutex_unlock(&v.lock);
 }
 
@@ -250,7 +297,8 @@ void video_renderer_reset(void) {
     pthread_mutex_unlock(&v.lock);
 }
 
-void video_renderer_push(const uint8_t *data, int len) {
+void video_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
+    int64_t arrival_us = now_us();
     /* UxPlay sets data[0] = 1 on packets that failed decryption or NAL parsing. */
     if (len < 5 || data[0]) {
         atomic_fetch_add(&v.frames_dropped, 1);
@@ -271,7 +319,8 @@ void video_renderer_push(const uint8_t *data, int len) {
     uint8_t *buffer = index >= 0 ? AMediaCodec_getInputBuffer(v.decoder, index, &capacity) : NULL;
     if (buffer && capacity >= (size_t) len) {
         memcpy(buffer, data, len);
-        AMediaCodec_queueInputBuffer(v.decoder, index, 0, len, now_us(), 0);
+        remember_frame(arrival_us, ntp_remote);
+        AMediaCodec_queueInputBuffer(v.decoder, index, 0, len, arrival_us, 0);
         atomic_fetch_add(&v.frames_in, 1);
     } else {
         if (buffer) AMediaCodec_queueInputBuffer(v.decoder, index, 0, 0, now_us(), 0);

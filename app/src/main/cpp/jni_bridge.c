@@ -3,6 +3,7 @@
 #include <pthread.h>
 
 #include "airscreen.h"
+#include "recording.h"
 #include "video_renderer.h"
 
 static JavaVM *vm;
@@ -68,28 +69,41 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *jvm, void *reserved) {
     return JNI_VERSION_1_6;
 }
 
+static const char *utf(JNIEnv *env, jstring s) {
+    return s ? (*env)->GetStringUTFChars(env, s, NULL) : NULL;
+}
+
+static void release_utf(JNIEnv *env, jstring s, const char *chars) {
+    if (s) (*env)->ReleaseStringUTFChars(env, s, chars);
+}
+
 JNIEXPORT jint JNICALL
 Java_dev_airscreen_Native_nativeStart(JNIEnv *env, jclass cls, jstring name, jbyteArray hw_addr,
                                       jint width, jint height, jint refresh_hz, jint max_fps,
-                                      jboolean h265, jstring keyfile) {
+                                      jboolean h265, jstring keyfile, jstring files_dir, jstring replay) {
     receiver_config_t cfg = {
-        .name = (*env)->GetStringUTFChars(env, name, NULL),
+        .name = utf(env, name),
         .width = (uint16_t) width,
         .height = (uint16_t) height,
         .refresh_hz = (uint16_t) refresh_hz,
         .max_fps = (uint16_t) max_fps,
         .h265 = h265,
-        .keyfile = (*env)->GetStringUTFChars(env, keyfile, NULL),
+        .keyfile = utf(env, keyfile),
+        .files_dir = utf(env, files_dir),
+        .replay = utf(env, replay),
     };
     (*env)->GetByteArrayRegion(env, hw_addr, 0, sizeof(cfg.hw_addr), (jbyte *) cfg.hw_addr);
-    int result = receiver_start(&cfg);
-    (*env)->ReleaseStringUTFChars(env, name, cfg.name);
-    (*env)->ReleaseStringUTFChars(env, keyfile, cfg.keyfile);
+    int result = cfg.replay ? replay_start(&cfg) : receiver_start(&cfg);
+    release_utf(env, name, cfg.name);
+    release_utf(env, keyfile, cfg.keyfile);
+    release_utf(env, files_dir, cfg.files_dir);
+    release_utf(env, replay, cfg.replay);
     return result;
 }
 
 JNIEXPORT void JNICALL
 Java_dev_airscreen_Native_nativeStop(JNIEnv *env, jclass cls) {
+    replay_stop();
     receiver_stop();
 }
 

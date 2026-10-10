@@ -3,9 +3,11 @@
 #include <math.h>
 #include <media/NdkMediaCodec.h>
 #include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
+#include "airscreen.h"
 #include "alac_decoder.h"
 #include "audio_renderer.h"
 
@@ -19,6 +21,8 @@
 #define JITTER_FRAMES (SAMPLE_RATE * 30 / 1000)
 #define MAX_BUFFER_FRAMES (SAMPLE_RATE * 80 / 1000)
 #define MAX_PACKET_FRAMES 4096
+#define MAX_SAMPLES 256
+#define OFFSET_STALE_NS 500000000LL
 
 /* At most one decoder exists, chosen by ct: AAC (4, 8) through MediaCodec, ALAC (2) through Apple's decoder. */
 static struct {
@@ -32,9 +36,14 @@ static struct {
     int64_t stats_start_us;
     int32_t stats_xruns;        /* AAudio xrun count at stats_start_us */
     int64_t dropped_frames;     /* since stats_start_us */
+    int latency_count;          /* out_latency_us samples since stats_start_us */
+    int64_t latency_us[MAX_SAMPLES];
     float gain;
     int16_t pcm[MAX_PACKET_FRAMES * CHANNELS];
 } a = { .lock = PTHREAD_MUTEX_INITIALIZER, .gain = 1.0f };
+
+/* Written by the audio thread, read lock-free by video. */
+static _Atomic int64_t presented_offset_ns, presented_at_ns;
 
 static AMediaCodec *create_aac(unsigned char ct) {
     /* AudioSpecificConfig: AAC-ELD 44100 stereo 480 spf, AAC-LC 44100 stereo */
@@ -64,9 +73,12 @@ static AMediaCodec *create_aac(unsigned char ct) {
 }
 
 static int64_t now_us(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    return airscreen_now_ns() / 1000;
+}
+
+static int compare_i64(const void *x, const void *y) {
+    int64_t p = *(const int64_t *) x, q = *(const int64_t *) y;
+    return (p > q) - (p < q);
 }
 
 static int32_t max_i32(int32_t x, int32_t y) { return x > y ? x : y; }
@@ -115,6 +127,7 @@ static void open_stream_locked(void) {
     a.stats_start_us = now_us();
     a.stats_xruns = 0;
     a.dropped_frames = 0;
+    a.latency_count = 0;
 }
 
 static void stop_locked(void) {
@@ -147,17 +160,33 @@ static void write_silence_locked(int frames) {
 static void log_stats_locked(int64_t now) {
     int32_t xruns = AAudioStream_getXRunCount(a.stream);
     int64_t level = AAudioStream_getFramesWritten(a.stream) - AAudioStream_getFramesRead(a.stream);
-    __android_log_print(ANDROID_LOG_INFO, STATS_TAG, "audio xruns=%d dropped_frames=%lld level_ms=%lld",
+    double p50 = 0, p99 = 0;
+    if (a.latency_count) {
+        qsort(a.latency_us, a.latency_count, sizeof(int64_t), compare_i64);
+        p50 = a.latency_us[a.latency_count / 2] / 1000.0;
+        p99 = a.latency_us[(a.latency_count * 99) / 100] / 1000.0;
+    }
+    __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
+                        "audio xruns=%d dropped_frames=%lld level_ms=%lld out_latency_ms p50=%.1f p99=%.1f",
                         xruns - a.stats_xruns, (long long) a.dropped_frames,
-                        (long long) (level * 1000 / SAMPLE_RATE));
+                        (long long) (level * 1000 / SAMPLE_RATE), p50, p99);
     a.stats_start_us = now;
     a.stats_xruns = xruns;
     a.dropped_frames = 0;
+    a.latency_count = 0;
+}
+
+/* frame_index plays at the returned CLOCK_MONOTONIC ns, extrapolated from the stream's latest
+ * presentation timestamp, which covers the HAL and device path. 0 before the stream has one. */
+static int64_t presentation_ns_locked(int64_t frame_index) {
+    int64_t position, time_ns;
+    if (AAudioStream_getTimestamp(a.stream, CLOCK_MONOTONIC, &position, &time_ns) != AAUDIO_OK) return 0;
+    return time_ns + (frame_index - position) * 1000000000LL / SAMPLE_RATE;
 }
 
 /* Plays immediately; when the stream has run dry, primes it with prime_frames of silence
  * so network jitter does not cause an underrun per packet. Frames that do not fit are dropped. */
-static void write_pcm_locked(const int16_t *pcm, int frames) {
+static void write_pcm_locked(const int16_t *pcm, int frames, uint64_t ntp_remote) {
     if (frames <= 0) return;
     if (a.stream && AAudioStream_getState(a.stream) == AAUDIO_STREAM_STATE_DISCONNECTED) {
         LOGI("audio device changed, reopening stream");
@@ -172,20 +201,31 @@ static void write_pcm_locked(const int16_t *pcm, int frames) {
     for (int i = 0; i < frames * CHANNELS; i++) {
         a.pcm[i] = (int16_t) (pcm[i] * a.gain);
     }
+    int64_t first_frame = AAudioStream_getFramesWritten(a.stream);
     aaudio_result_t written = AAudioStream_write(a.stream, a.pcm, frames, 0);
     a.dropped_frames += written < 0 ? frames : frames - written;
+    int64_t presented_ns = presentation_ns_locked(first_frame);
     int64_t now = now_us();
+    if (presented_ns) {
+        int64_t last_ns = presented_ns + (int64_t) max_i32(written, 0) * 1000000000LL / SAMPLE_RATE;
+        if (a.latency_count < MAX_SAMPLES) a.latency_us[a.latency_count++] = last_ns / 1000 - now;
+        if (ntp_remote) {
+            atomic_store(&presented_offset_ns, presented_ns - (int64_t) ntp_remote);
+            atomic_store(&presented_at_ns, now * 1000);
+        }
+    }
     if (now - a.stats_start_us >= 1000000) log_stats_locked(now);
 }
 
-static void decode_aac_locked(const uint8_t *data, int len) {
+/* The sender time rides through the decoder as the presentation time, in us. */
+static void decode_aac_locked(const uint8_t *data, int len, uint64_t ntp_remote) {
     ssize_t in = AMediaCodec_dequeueInputBuffer(a.aac, 5000);
     if (in >= 0) {
         size_t capacity;
         uint8_t *buffer = AMediaCodec_getInputBuffer(a.aac, in, &capacity);
         if ((size_t) len > capacity) len = (int) capacity;
         memcpy(buffer, data, len);
-        AMediaCodec_queueInputBuffer(a.aac, in, 0, len, 0, 0);
+        AMediaCodec_queueInputBuffer(a.aac, in, 0, len, (int64_t) (ntp_remote / 1000), 0);
     }
     for (;;) {
         AMediaCodecBufferInfo info;
@@ -194,7 +234,8 @@ static void decode_aac_locked(const uint8_t *data, int len) {
         if (out < 0) break;
         size_t size;
         uint8_t *buffer = AMediaCodec_getOutputBuffer(a.aac, out, &size);
-        write_pcm_locked((const int16_t *) (buffer + info.offset), info.size / (int) (sizeof(int16_t) * CHANNELS));
+        write_pcm_locked((const int16_t *) (buffer + info.offset), info.size / (int) (sizeof(int16_t) * CHANNELS),
+                         (uint64_t) info.presentationTimeUs * 1000);
         AMediaCodec_releaseOutputBuffer(a.aac, out, false);
     }
 }
@@ -222,16 +263,23 @@ void audio_renderer_start(unsigned char ct, unsigned short spf) {
     pthread_mutex_unlock(&a.lock);
 }
 
-void audio_renderer_push(const uint8_t *data, int len) {
+void audio_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
     pthread_mutex_lock(&a.lock);
     if (a.aac) {
-        decode_aac_locked(data, len);
+        decode_aac_locked(data, len, ntp_remote);
     } else if (a.alac) {
         int16_t out[MAX_PACKET_FRAMES * CHANNELS];
         int frames = alac_decoder_decode(a.alac, data, len, out, a.spf);
-        write_pcm_locked(out, frames);
+        write_pcm_locked(out, frames, ntp_remote);
     }
     pthread_mutex_unlock(&a.lock);
+}
+
+bool audio_renderer_offset(int64_t *offset_ns) {
+    int64_t at = atomic_load(&presented_at_ns);
+    if (!at || airscreen_now_ns() - at > OFFSET_STALE_NS) return false;
+    *offset_ns = atomic_load(&presented_offset_ns);
+    return true;
 }
 
 /* AirPlay volume: -144 is mute, otherwise -30..0 dB; UxPlay treats -30 as silent too. */
