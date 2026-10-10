@@ -27,6 +27,7 @@
 #define MAX_OUT_FRAMES (MAX_PACKET_FRAMES * 5)
 #define MAX_SAMPLES 256
 #define OFFSET_STALE_NS 500000000LL
+#define OFFSET_SMOOTHING 16 /* packets of exponential averaging for the video schedule */
 
 /* PCM at the stream rate between the network thread (sole writer) and the AAudio callback (sole
  * reader). Arrival and playback run at the same rate, so whatever is queued when playback starts
@@ -66,7 +67,7 @@ static struct {
 } a = { .lock = PTHREAD_MUTEX_INITIALIZER, .gain = 1.0f };
 
 /* Written by the audio thread, read lock-free by video. */
-static _Atomic int64_t presented_offset_ns, presented_at_ns;
+static _Atomic int64_t presented_offset_ns, smoothed_offset_ns, presented_at_ns;
 
 static AMediaCodec *create_aac(unsigned char ct) {
     /* AudioSpecificConfig: AAC-ELD 44100 stereo 480 spf, AAC-LC 44100 stereo */
@@ -281,7 +282,11 @@ static void write_pcm_locked(const int16_t *pcm, int frames, uint64_t ntp_remote
         int64_t last_ns = presented_ns + (int64_t) queued * 1000000000LL / a.rate;
         if (a.latency_count < MAX_SAMPLES) a.latency_us[a.latency_count++] = last_ns / 1000 - now;
         if (ntp_remote) {
-            atomic_store(&presented_offset_ns, presented_ns - (int64_t) ntp_remote);
+            int64_t offset = presented_ns - (int64_t) ntp_remote;
+            int64_t smoothed = atomic_load(&smoothed_offset_ns);
+            bool fresh = now * 1000 - atomic_load(&presented_at_ns) <= OFFSET_STALE_NS;
+            atomic_store(&presented_offset_ns, offset);
+            atomic_store(&smoothed_offset_ns, fresh ? smoothed + (offset - smoothed) / OFFSET_SMOOTHING : offset);
             atomic_store(&presented_at_ns, now * 1000);
         }
     }
@@ -346,10 +351,11 @@ void audio_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
     pthread_mutex_unlock(&a.lock);
 }
 
-bool audio_renderer_offset(int64_t *offset_ns) {
+bool audio_renderer_offset(int64_t *offset_ns, int64_t *smoothed_ns) {
     int64_t at = atomic_load(&presented_at_ns);
     if (!at || airscreen_now_ns() - at > OFFSET_STALE_NS) return false;
     *offset_ns = atomic_load(&presented_offset_ns);
+    *smoothed_ns = atomic_load(&smoothed_offset_ns);
     return true;
 }
 

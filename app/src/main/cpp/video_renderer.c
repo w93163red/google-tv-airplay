@@ -19,6 +19,7 @@
 #define MAX_SAMPLES 512
 
 #define PENDING_SLOTS 256
+#define MAX_SYNC_DELAY_NS 500000000LL
 
 typedef struct {
     int count;
@@ -93,18 +94,24 @@ static uint64_t frame_remote_locked(int64_t pts_us) {
     return 0;
 }
 
-/* pts_us is the frame's local arrival time. */
-static void note_presented(int64_t pts_us, int64_t decoded_us, int64_t presented_ns) {
-    int64_t audio_offset;
+/* When to show a frame (pts_us is its local arrival time): when audio plays the same sender time,
+ * using the averaged audio offset so the schedule does not jitter, never before now and never more
+ * than MAX_SYNC_DELAY_NS after arrival. With no audio playing, now. Records the frame's stats. */
+static int64_t schedule_frame(int64_t pts_us, int64_t decoded_ns) {
+    int64_t audio_offset, smoothed_offset, present_ns = decoded_ns;
     pthread_mutex_lock(&t.lock);
-    t.rendered++;
-    add_sample(&t.decode, decoded_us - pts_us);
-    add_sample(&t.glass, presented_ns / 1000 - pts_us);
     uint64_t remote = frame_remote_locked(pts_us);
-    if (remote && audio_renderer_offset(&audio_offset)) {
-        add_sample(&t.av, ((int64_t) remote + audio_offset - presented_ns) / 1000);
+    bool audio = remote && audio_renderer_offset(&audio_offset, &smoothed_offset);
+    if (audio) {
+        int64_t target = (int64_t) remote + smoothed_offset, latest = pts_us * 1000 + MAX_SYNC_DELAY_NS;
+        present_ns = target < decoded_ns ? decoded_ns : target > latest ? latest : target;
+        add_sample(&t.av, ((int64_t) remote + audio_offset - present_ns) / 1000);
     }
+    t.rendered++;
+    add_sample(&t.decode, decoded_ns / 1000 - pts_us);
+    add_sample(&t.glass, present_ns / 1000 - pts_us);
     pthread_mutex_unlock(&t.lock);
+    return present_ns;
 }
 
 static void log_stats(void) {
@@ -139,7 +146,7 @@ static void report_size(AMediaCodec *decoder) {
     bridge_emit(EVENT_VIDEO_SIZE, NULL, w, h);
 }
 
-/* Releases every frame to the surface the moment it is decoded. Never takes v.lock. */
+/* Releases every frame to the surface as soon as it is decoded, timed by schedule_frame. Never takes v.lock. */
 static void *output_loop(void *arg) {
     AMediaCodec *decoder = arg;
     int64_t window_start = now_us();
@@ -148,9 +155,11 @@ static void *output_loop(void *arg) {
         ssize_t index = AMediaCodec_dequeueOutputBuffer(decoder, &info, OUTPUT_TIMEOUT_US);
         int64_t now = now_us();
         if (index >= 0) {
-            bool render = info.size > 0;
-            AMediaCodec_releaseOutputBuffer(decoder, index, render);
-            if (render) note_presented(info.presentationTimeUs, now, now * 1000);
+            if (info.size > 0) {
+                AMediaCodec_releaseOutputBufferAtTime(decoder, index, schedule_frame(info.presentationTimeUs, now * 1000));
+            } else {
+                AMediaCodec_releaseOutputBuffer(decoder, index, false);
+            }
         } else if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             report_size(decoder);
         }
