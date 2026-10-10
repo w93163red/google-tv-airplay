@@ -2,6 +2,7 @@ package dev.airscreen
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.media.MediaCodecInfo
@@ -45,8 +46,7 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Asks the TV for its low-latency (game) mode over HDMI ALLM; set once so it never flips mid-session.
-        window.attributes = window.attributes.apply { preferMinimalPostProcessing = true }
+        applyMinimalPostProcessing(intent)
         landscapeScale = prefs().getString(PREF_LANDSCAPE_SCALE, null)
             ?.let { saved -> ScaleMode.entries.firstOrNull { it.name == saved } } ?: ScaleMode.Fill
         surface = AspectSurfaceView(this)
@@ -144,6 +144,24 @@ class MainActivity : Activity() {
     private fun replayPath(): String? =
         intent.getStringExtra("replay")?.takeIf { applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        applyMinimalPostProcessing(intent)
+    }
+
+    /**
+     * Asks the display for its low-latency (game) mode over HDMI ALLM. On by default; `--ez allm false` on an
+     * `am start` turns it off and the choice persists, for A/B checks of how the display renders game mode.
+     */
+    private fun applyMinimalPostProcessing(intent: Intent?) {
+        if (intent?.hasExtra(EXTRA_ALLM) == true) {
+            prefs().edit().putBoolean(PREF_ALLM, intent.getBooleanExtra(EXTRA_ALLM, true)).apply()
+        }
+        val allm = prefs().getBoolean(PREF_ALLM, true)
+        window.attributes = window.attributes.apply { preferMinimalPostProcessing = allm }
+        Log.i("AirScreen", "preferMinimalPostProcessing=$allm")
+    }
+
     private fun prefs() = getSharedPreferences("airscreen", Context.MODE_PRIVATE)
 
     private fun showStandby(titleText: String, subtitleText: String, hintText: String) {
@@ -207,6 +225,8 @@ class MainActivity : Activity() {
     private companion object {
         const val TAG = "AirScreen"
         const val PREF_LANDSCAPE_SCALE = "landscape_scale"
+        const val PREF_ALLM = "allm"
+        const val EXTRA_ALLM = "allm"
         val MIMES = listOf("video/avc", "video/hevc")
     }
 }
