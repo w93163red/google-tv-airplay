@@ -34,22 +34,28 @@ import kotlin.math.roundToInt
 
 class MainActivity : Activity() {
     private val main = Handler(Looper.getMainLooper())
-    private lateinit var surface: AspectSurfaceView
+    private lateinit var surface: StreamSurfaceView
+    private lateinit var sampler: ContentSampler
     private lateinit var standby: View
     private lateinit var title: TextView
     private lateinit var subtitle: TextView
     private lateinit var hint: TextView
-    private lateinit var scaleHint: TextView
-    private val hideScaleHint = Runnable { scaleHint.visibility = View.GONE }
+    private lateinit var zoomHint: TextView
+    private val hideZoomHint = Runnable { zoomHint.visibility = View.GONE }
 
-    private var landscapeScale = ScaleMode.Fill
+    private var zoomMode = ZoomMode.Smart
+    private var zoom: ZoomState = ZoomState.Idle
+
+    /** The stream [sampler] watches for bars, or null while it is stopped. */
+    private var sampled: Size? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         applyMinimalPostProcessing(intent)
-        landscapeScale = prefs().getString(PREF_LANDSCAPE_SCALE, null)
-            ?.let { saved -> ScaleMode.entries.firstOrNull { it.name == saved } } ?: ScaleMode.Fill
-        surface = AspectSurfaceView(this)
+        zoomMode = prefs().getString(PREF_ZOOM_MODE, null)
+            ?.let { saved -> ZoomMode.entries.firstOrNull { it.name == saved } } ?: ZoomMode.Smart
+        surface = StreamSurfaceView(this)
+        sampler = ContentSampler(surface, ::onSample)
         surface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
                 holder.surface.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
@@ -61,7 +67,7 @@ class MainActivity : Activity() {
         title = text(40f)
         subtitle = text(22f)
         hint = text(22f)
-        scaleHint = text(28f).apply {
+        zoomHint = text(28f).apply {
             setBackgroundColor(0xB0000000.toInt())
             setPadding(48, 24, 48, 24)
             visibility = View.GONE
@@ -78,7 +84,7 @@ class MainActivity : Activity() {
             setBackgroundColor(Color.BLACK)
             addView(surface, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
             addView(standby, FrameLayout.LayoutParams(-1, -1))
-            addView(scaleHint, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+            addView(zoomHint, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         })
     }
 
@@ -92,6 +98,11 @@ class MainActivity : Activity() {
         super.onStop()
     }
 
+    override fun onDestroy() {
+        sampler.quit()
+        super.onDestroy()
+    }
+
     /** Starts the native receiver configured for this activity's display; returns its status. */
     fun startNative(): Int {
         val config = displayConfig()
@@ -102,13 +113,15 @@ class MainActivity : Activity() {
     }
 
     fun render(state: ReceiverState) {
+        val stream = (state as? ReceiverState.Mirroring)?.let { Size(it.width, it.height) }
+        sampleForBars(stream?.takeIf { zoomMode == ZoomMode.Smart && it.width > 0 && it.height > 0 })
         when (val s = state) {
             ReceiverState.Starting -> showStandby("AirScreen", "正在启动…", "")
             is ReceiverState.Advertising ->
                 showStandby(s.name, s.ip, "在 iPhone 控制中心点“屏幕镜像”，选择 ${s.name}")
             is ReceiverState.Mirroring -> {
                 standby.visibility = View.GONE
-                surface.setStream(s.width, s.height, landscapeScale)
+                surface.show(Size(s.width, s.height), zoomMode, zoom.zoom)
             }
             is ReceiverState.AudioOnly -> showStandby(deviceName(), "正在播放 ${s.client} 的音频", "")
             is ReceiverState.Failed -> showStandby("AirScreen", "出错了", s.reason)
@@ -120,25 +133,39 @@ class MainActivity : Activity() {
         }
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        val s = Receiver.state
-        val confirm = keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
-        val parent = surface.parent as View
-        if (!confirm || s !is ReceiverState.Mirroring || !fillApplies(parent.width, parent.height, s.width, s.height)) {
-            return super.onKeyDown(keyCode, event)
+    /** Watches [stream] for bars, starting again from no zoom when it changes; null stops watching. */
+    private fun sampleForBars(stream: Size?) {
+        if (stream == sampled) return
+        sampled = stream
+        zoom = ZoomState.Idle
+        if (stream == null) sampler.stop() else sampler.start(stream)
+    }
+
+    private fun onSample(content: ContentRect?, now: Long) {
+        val next = zoom.next(content, now)
+        val changed = next.zoom != zoom.zoom
+        zoom = next
+        if (changed) {
+            Log.i(TAG, "zoom ${next.zoom ?: "off"}")
+            render(Receiver.state)
         }
-        if (event.repeatCount == 0) toggleLandscapeScale()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val confirm = keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
+        if (!confirm || Receiver.state !is ReceiverState.Mirroring) return super.onKeyDown(keyCode, event)
+        if (event.repeatCount == 0) toggleZoomMode()
         return true
     }
 
-    private fun toggleLandscapeScale() {
-        landscapeScale = if (landscapeScale == ScaleMode.Fill) ScaleMode.Fit else ScaleMode.Fill
-        prefs().edit().putString(PREF_LANDSCAPE_SCALE, landscapeScale.name).apply()
+    private fun toggleZoomMode() {
+        zoomMode = if (zoomMode == ZoomMode.Smart) ZoomMode.Full else ZoomMode.Smart
+        prefs().edit().putString(PREF_ZOOM_MODE, zoomMode.name).apply()
         render(Receiver.state)
-        scaleHint.text = if (landscapeScale == ScaleMode.Fill) "填满屏幕" else "完整画面（按确认键切换）"
-        scaleHint.visibility = View.VISIBLE
-        main.removeCallbacks(hideScaleHint)
-        main.postDelayed(hideScaleHint, 1500)
+        zoomHint.text = if (zoomMode == ZoomMode.Smart) "智能填满" else "完整画面（按确认键切换）"
+        zoomHint.visibility = View.VISIBLE
+        main.removeCallbacks(hideZoomHint)
+        main.postDelayed(hideZoomHint, 1500)
     }
 
     /** Debug builds only: `am start -S -n dev.airscreen/.MainActivity --es replay <recording>`. */
@@ -225,33 +252,66 @@ class MainActivity : Activity() {
 
     private companion object {
         const val TAG = "AirScreen"
-        const val PREF_LANDSCAPE_SCALE = "landscape_scale"
+        const val PREF_ZOOM_MODE = "zoom_mode"
         const val PREF_ALLM = "allm"
         const val EXTRA_ALLM = "allm"
         val MIMES = listOf("video/avc", "video/hevc")
     }
 }
 
-/** SurfaceView sized to the stream per [streamViewSize], centered by its parent; Fill overflow is clipped. */
-class AspectSurfaceView(context: Context) : SurfaceView(context) {
-    private var streamWidth = 0
-    private var streamHeight = 0
-    private var landscape = ScaleMode.Fit
+/**
+ * SurfaceView laid out at the size that fits the whole stream, centered by its parent. Zoom is a scale and
+ * translation on top of that layout, animated, so a zoom change never resizes the surface.
+ */
+class StreamSurfaceView(context: Context) : SurfaceView(context) {
+    private var stream = Size(0, 0)
+    private var mode = ZoomMode.Smart
+    private var content: ContentRect? = null
+    private var parentSize = Size(0, 0)
+    private var shown: Placement? = null
 
-    fun setStream(width: Int, height: Int, landscape: ScaleMode) {
-        if (width != streamWidth || height != streamHeight || landscape != this.landscape) {
-            streamWidth = width
-            streamHeight = height
-            this.landscape = landscape
-            requestLayout()
-        }
+    fun show(stream: Size, mode: ZoomMode, content: ContentRect?) {
+        val resized = stream != this.stream
+        this.stream = stream
+        this.mode = mode
+        this.content = content
+        if (resized) requestLayout() else place(animate = true)
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val size = streamViewSize(
-            MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.getSize(heightMeasureSpec),
-            streamWidth, streamHeight, landscape,
-        )
-        setMeasuredDimension(size.width, size.height)
+        parentSize = Size(MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.getSize(heightMeasureSpec))
+        val whole = streamPlacement(parentSize, stream, ZoomMode.Full, null)
+        setMeasuredDimension(whole.width, whole.height)
+    }
+
+    override fun onLayout(changed: Boolean, left: Int, top: Int, right: Int, bottom: Int) {
+        super.onLayout(changed, left, top, right, bottom)
+        if (changed) shown = null
+        place(animate = false)
+    }
+
+    private fun place(animate: Boolean) {
+        if (width == 0 || height == 0) return
+        val target = streamPlacement(parentSize, stream, mode, content)
+        if (target == shown) return
+        shown = target
+        val scaleX = target.width.toFloat() / width
+        val scaleY = target.height.toFloat() / height
+        val translationX = target.x + target.width / 2f - parentSize.width / 2f
+        val translationY = target.y + target.height / 2f - parentSize.height / 2f
+        animate().cancel()
+        if (animate) {
+            animate().scaleX(scaleX).scaleY(scaleY).translationX(translationX).translationY(translationY)
+                .setDuration(ZOOM_ANIMATION_MS).start()
+        } else {
+            this.scaleX = scaleX
+            this.scaleY = scaleY
+            this.translationX = translationX
+            this.translationY = translationY
+        }
+    }
+
+    private companion object {
+        const val ZOOM_ANIMATION_MS = 250L
     }
 }
