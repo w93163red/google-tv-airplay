@@ -70,6 +70,7 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
 | `dnssd_android.c` | the dnssd private backend. Builds TXT records like UxPlay's mdnsd backend, forwards register and unregister to Kotlin |
 | `video_renderer.c` | AMediaCodec decoder on the `ANativeWindow`. H.264 and H.265, codec switch, low-latency config |
 | `audio_renderer.c` | AAC-ELD and AAC-LC through AMediaCodec, ALAC through Apple's decoder, PCM out through AAudio |
+| `resampler.c` | streaming stereo sample-rate conversion, polyphase windowed sinc |
 | `recording.c` | the session recording file format, the recorder, and replay of a recording into the renderers |
 | `jni_bridge.c` | JNI entry points and the event upcall. Nothing else |
 
@@ -78,7 +79,7 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
 1. Decoder format sets `low-latency=1`, `priority=0`, `max-width` and `max-height` to the advertised display so rotation and resolution changes reconfigure without a new codec.
 2. Input is queued from the network callback as soon as it arrives. No reordering buffer, no pacing. An access unit is never dropped because the decoder is busy: the mirror thread blocks until an input buffer frees up, so TCP backpressure slows the sender instead of a lost reference frame corrupting the picture until the next IDR.
 3. Output is released with `render=true` as soon as it is dequeued. No presentation-time scheduling.
-4. Audio output uses AAudio `PERFORMANCE_MODE_LOW_LATENCY` and a small jitter buffer.
+4. Audio output uses AAudio `PERFORMANCE_MODE_LOW_LATENCY` in callback mode at the device's own sample rate, with `resampler.c` converting from 44.1 kHz. On the Streamer that is the only combination measured to get a FAST track: a blocking-write stream at any rate lands on the deep-buffer mixer with a legacy burst of 190 ms or more, a 44.1 kHz callback stream gets a normal track, and `AAudioStreamBuilder_setSampleRateConversionQuality` is in neither NDK r27 nor the device's libaaudio. The AAudio buffer targets 40 ms (at least two bursts). Between the network thread and the callback sits a ring that is primed to 30 ms whenever it runs dry and cut back to 30 ms when it holds more than 90 ms, because arrival and playback run at the same rate and any backlog would otherwise persist as latency.
 5. The `SurfaceView` (not `TextureView`) keeps the stream aspect ratio. Portrait streams fit inside the screen on black. Landscape streams fill the screen by default (centered, overflow cropped), because iOS sends landscape at the phone's ~2.17:1 and already pillarboxes 16:9 video inside it; the remote's OK button toggles fill and fit, persisted.
 
 ## Verification

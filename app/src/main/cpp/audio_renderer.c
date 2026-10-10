@@ -10,19 +10,37 @@
 #include "airscreen.h"
 #include "alac_decoder.h"
 #include "audio_renderer.h"
+#include "resampler.h"
 
 #define TAG "AirScreen"
 #define STATS_TAG "AirScreenStats"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define SAMPLE_RATE 44100
+#define SAMPLE_RATE 44100 /* AirPlay's rate; the stream runs at the device's */
 #define CHANNELS 2
-#define JITTER_FRAMES (SAMPLE_RATE * 30 / 1000)
-#define MAX_BUFFER_FRAMES (SAMPLE_RATE * 80 / 1000)
-#define MAX_PACKET_FRAMES 4096
+#define TARGET_MS 40      /* AAudio buffer */
+#define PRIME_MS 30       /* jitter buffer refilled after the ring runs dry */
+#define TRIM_MS 90        /* queued audio beyond this is cut back to PRIME_MS */
+#define RING_FRAMES 16384 /* power of two */
+#define MAX_PACKET_FRAMES RESAMPLER_MAX_IN
+#define MAX_OUT_FRAMES (MAX_PACKET_FRAMES * 5)
 #define MAX_SAMPLES 256
 #define OFFSET_STALE_NS 500000000LL
+
+/* PCM at the stream rate between the network thread (sole writer) and the AAudio callback (sole
+ * reader). Arrival and playback run at the same rate, so whatever is queued when playback starts
+ * would stay queued for good: the callback refills an empty ring to prime_frames before playing
+ * and cuts a ring above trim_frames back to prime_frames. */
+static struct {
+    int16_t pcm[RING_FRAMES * CHANNELS];
+    atomic_uint written, read;  /* frame counters, wrapping */
+    atomic_bool dry;            /* the callback plays silence until prime_frames are queued */
+    _Atomic int64_t shift;      /* stream frame index minus ring frame index: silence played minus frames cut */
+    atomic_int underruns;       /* times the ring ran dry while playing */
+    atomic_int trims;           /* times queued audio was cut */
+    uint32_t prime_frames, trim_frames;
+} ring;
 
 /* At most one decoder exists, chosen by ct: AAC (4, 8) through MediaCodec, ALAC (2) through Apple's decoder. */
 static struct {
@@ -32,14 +50,19 @@ static struct {
     AMediaCodec *aac;
     alac_decoder_t *alac;
     AAudioStream *stream;
-    int32_t prime_frames;       /* silence written when the stream has run dry */
+    int32_t rate;               /* stream sample rate */
+    resampler_t resampler;      /* SAMPLE_RATE to rate */
+    int64_t ring_frames;        /* frames ever written to the ring for this stream */
     int64_t stats_start_us;
     int32_t stats_xruns;        /* AAudio xrun count at stats_start_us */
+    int32_t stats_underruns;    /* ring.underruns at stats_start_us */
+    int32_t stats_trims;        /* ring.trims at stats_start_us */
     int64_t dropped_frames;     /* since stats_start_us */
     int latency_count;          /* out_latency_us samples since stats_start_us */
     int64_t latency_us[MAX_SAMPLES];
     float gain;
     int16_t pcm[MAX_PACKET_FRAMES * CHANNELS];
+    int16_t resampled[MAX_OUT_FRAMES * CHANNELS];
 } a = { .lock = PTHREAD_MUTEX_INITIALIZER, .gain = 1.0f };
 
 /* Written by the audio thread, read lock-free by video. */
@@ -83,16 +106,47 @@ static int compare_i64(const void *x, const void *y) {
 
 static int32_t max_i32(int32_t x, int32_t y) { return x > y ? x : y; }
 
-static AAudioStream *build_stream(int32_t capacity) {
+static aaudio_data_callback_result_t on_audio(AAudioStream *stream, void *user, void *data, int32_t frames) {
+    int16_t *out = data;
+    uint32_t r = atomic_load_explicit(&ring.read, memory_order_relaxed);
+    uint32_t queued = atomic_load_explicit(&ring.written, memory_order_acquire) - r;
+    bool dry = atomic_load_explicit(&ring.dry, memory_order_relaxed);
+    if (dry && queued >= ring.prime_frames) dry = false;
+    if (!dry && queued > ring.trim_frames) {
+        uint32_t cut = queued - ring.prime_frames;
+        r += cut;
+        queued -= cut;
+        atomic_fetch_sub_explicit(&ring.shift, cut, memory_order_relaxed);
+        atomic_fetch_add_explicit(&ring.trims, 1, memory_order_relaxed);
+    }
+    uint32_t n = dry ? 0 : queued < (uint32_t) frames ? queued : (uint32_t) frames;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t slot = (r + i) & (RING_FRAMES - 1);
+        out[i * 2] = ring.pcm[slot * 2];
+        out[i * 2 + 1] = ring.pcm[slot * 2 + 1];
+    }
+    if (n < (uint32_t) frames) {
+        memset(out + n * CHANNELS, 0, sizeof(int16_t) * CHANNELS * (frames - n));
+        atomic_fetch_add_explicit(&ring.shift, frames - n, memory_order_relaxed);
+        if (!dry) atomic_fetch_add_explicit(&ring.underruns, 1, memory_order_relaxed);
+        dry = true;
+    }
+    atomic_store_explicit(&ring.dry, dry, memory_order_relaxed);
+    atomic_store_explicit(&ring.read, r + n, memory_order_release);
+    return AAUDIO_CALLBACK_RESULT_CONTINUE;
+}
+
+/* Callback mode at the device's own rate: on the Streamer that is what reaches the FAST mixer
+ * (48 kHz) and keeps the legacy path from sizing its burst to half a second. */
+static AAudioStream *build_stream(void) {
     AAudioStreamBuilder *builder;
     if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) return NULL;
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
     AAudioStreamBuilder_setChannelCount(builder, CHANNELS);
-    AAudioStreamBuilder_setSampleRate(builder, SAMPLE_RATE);
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
     AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
-    AAudioStreamBuilder_setBufferCapacityInFrames(builder, capacity);
+    AAudioStreamBuilder_setDataCallback(builder, on_audio, NULL);
     AAudioStream *stream = NULL;
     aaudio_result_t result = AAudioStreamBuilder_openStream(builder, &stream);
     AAudioStreamBuilder_delete(builder);
@@ -103,39 +157,52 @@ static AAudioStream *build_stream(int32_t capacity) {
     return stream;
 }
 
-/* Buffer at least three bursts: without a fast mixer the burst can be as large as
- * MAX_BUFFER_FRAMES, and a one-burst buffer underruns on every scheduling hiccup. */
+/* The buffer is a latency target, at least two bursts on the low-latency path. On the legacy
+ * (NONE) path the burst is the track's notification period, not the mixer's, so it is not used. */
 static void open_stream_locked(void) {
-    AAudioStream *stream = build_stream(MAX_BUFFER_FRAMES * 2);
+    AAudioStream *stream = build_stream();
     if (!stream) return;
-    int32_t burst = AAudioStream_getFramesPerBurst(stream);
-    int32_t size = max_i32(MAX_BUFFER_FRAMES, 3 * burst);
-    if (AAudioStream_getBufferCapacityInFrames(stream) < size) {
+    a.rate = AAudioStream_getSampleRate(stream);
+    if (resampler_init(&a.resampler, SAMPLE_RATE, a.rate) != 0) {
         AAudioStream_close(stream);
-        stream = build_stream(size * 2);
-        if (!stream) return;
-        burst = AAudioStream_getFramesPerBurst(stream);
-        size = max_i32(MAX_BUFFER_FRAMES, 3 * burst);
+        return;
     }
-    AAudioStream_setBufferSizeInFrames(stream, size);
+    int32_t burst = AAudioStream_getFramesPerBurst(stream);
+    int32_t mode = AAudioStream_getPerformanceMode(stream);
+    int32_t target = a.rate * TARGET_MS / 1000;
+    AAudioStream_setBufferSizeInFrames(stream, mode == AAUDIO_PERFORMANCE_MODE_LOW_LATENCY ? max_i32(target, 2 * burst) : target);
+    atomic_store(&ring.written, 0);
+    atomic_store(&ring.read, 0);
+    atomic_store(&ring.dry, true);
+    atomic_store(&ring.shift, 0);
+    atomic_store(&ring.underruns, 0);
+    atomic_store(&ring.trims, 0);
+    ring.prime_frames = (uint32_t) (a.rate * PRIME_MS / 1000);
+    ring.trim_frames = (uint32_t) (a.rate * TRIM_MS / 1000);
+    a.ring_frames = 0;
     AAudioStream_requestStart(stream);
-    LOGI("AAudio stream: %d Hz, burst %d, buffer %d, capacity %d, performance mode %d",
-         AAudioStream_getSampleRate(stream), burst, AAudioStream_getBufferSizeInFrames(stream),
-         AAudioStream_getBufferCapacityInFrames(stream), AAudioStream_getPerformanceMode(stream));
+    LOGI("AAudio stream: %d Hz (resampled from %d), device %d, performance mode %d, burst %d, buffer %d, capacity %d",
+         a.rate, SAMPLE_RATE, AAudioStream_getDeviceId(stream), mode, burst,
+         AAudioStream_getBufferSizeInFrames(stream), AAudioStream_getBufferCapacityInFrames(stream));
     a.stream = stream;
-    a.prime_frames = max_i32(JITTER_FRAMES, burst);
     a.stats_start_us = now_us();
     a.stats_xruns = 0;
+    a.stats_underruns = 0;
+    a.stats_trims = 0;
     a.dropped_frames = 0;
     a.latency_count = 0;
 }
 
+static void close_stream_locked(void) {
+    if (!a.stream) return;
+    AAudioStream_requestStop(a.stream);
+    AAudioStream_close(a.stream);
+    a.stream = NULL;
+    resampler_free(&a.resampler);
+}
+
 static void stop_locked(void) {
-    if (a.stream) {
-        AAudioStream_requestStop(a.stream);
-        AAudioStream_close(a.stream);
-        a.stream = NULL;
-    }
+    close_stream_locked();
     if (a.aac) {
         AMediaCodec_stop(a.aac);
         AMediaCodec_delete(a.aac);
@@ -148,18 +215,11 @@ static void stop_locked(void) {
     a.ct = 0;
 }
 
-static void write_silence_locked(int frames) {
-    static const int16_t silence[MAX_PACKET_FRAMES * CHANNELS];
-    while (frames > 0) {
-        int n = frames < MAX_PACKET_FRAMES ? frames : MAX_PACKET_FRAMES;
-        AAudioStream_write(a.stream, silence, n, 0);
-        frames -= n;
-    }
-}
-
 static void log_stats_locked(int64_t now) {
     int32_t xruns = AAudioStream_getXRunCount(a.stream);
-    int64_t level = AAudioStream_getFramesWritten(a.stream) - AAudioStream_getFramesRead(a.stream);
+    int32_t underruns = atomic_load(&ring.underruns), trims = atomic_load(&ring.trims);
+    int64_t level = (int64_t) (atomic_load(&ring.written) - atomic_load(&ring.read)) +
+                    AAudioStream_getFramesWritten(a.stream) - AAudioStream_getFramesRead(a.stream);
     double p50 = 0, p99 = 0;
     if (a.latency_count) {
         qsort(a.latency_us, a.latency_count, sizeof(int64_t), compare_i64);
@@ -167,47 +227,58 @@ static void log_stats_locked(int64_t now) {
         p99 = a.latency_us[(a.latency_count * 99) / 100] / 1000.0;
     }
     __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
-                        "audio xruns=%d dropped_frames=%lld level_ms=%lld out_latency_ms p50=%.1f p99=%.1f",
-                        xruns - a.stats_xruns, (long long) a.dropped_frames,
-                        (long long) (level * 1000 / SAMPLE_RATE), p50, p99);
+                        "audio xruns=%d underruns=%d trims=%d dropped_frames=%lld level_ms=%lld "
+                        "out_latency_ms p50=%.1f p99=%.1f",
+                        xruns - a.stats_xruns, underruns - a.stats_underruns, trims - a.stats_trims,
+                        (long long) a.dropped_frames,
+                        (long long) (level * 1000 / a.rate), p50, p99);
     a.stats_start_us = now;
     a.stats_xruns = xruns;
+    a.stats_underruns = underruns;
+    a.stats_trims = trims;
     a.dropped_frames = 0;
     a.latency_count = 0;
 }
 
-/* frame_index plays at the returned CLOCK_MONOTONIC ns, extrapolated from the stream's latest
+/* stream_frame plays at the returned CLOCK_MONOTONIC ns, extrapolated from the stream's latest
  * presentation timestamp, which covers the HAL and device path. 0 before the stream has one. */
-static int64_t presentation_ns_locked(int64_t frame_index) {
+static int64_t presentation_ns_locked(int64_t stream_frame) {
     int64_t position, time_ns;
     if (AAudioStream_getTimestamp(a.stream, CLOCK_MONOTONIC, &position, &time_ns) != AAUDIO_OK) return 0;
-    return time_ns + (frame_index - position) * 1000000000LL / SAMPLE_RATE;
+    return time_ns + (stream_frame - position) * 1000000000LL / a.rate;
 }
 
-/* Plays immediately; when the stream has run dry, primes it with prime_frames of silence
- * so network jitter does not cause an underrun per packet. Frames that do not fit are dropped. */
+/* Queues PCM for the callback; frames that do not fit in the ring are dropped. */
 static void write_pcm_locked(const int16_t *pcm, int frames, uint64_t ntp_remote) {
     if (frames <= 0) return;
     if (a.stream && AAudioStream_getState(a.stream) == AAUDIO_STREAM_STATE_DISCONNECTED) {
         LOGI("audio device changed, reopening stream");
-        AAudioStream_close(a.stream);
-        a.stream = NULL;
+        close_stream_locked();
     }
     if (!a.stream) open_stream_locked();
     if (!a.stream) return;
     if (frames > MAX_PACKET_FRAMES) frames = MAX_PACKET_FRAMES;
-    int64_t level = AAudioStream_getFramesWritten(a.stream) - AAudioStream_getFramesRead(a.stream);
-    if (level <= 0) write_silence_locked(a.prime_frames);
     for (int i = 0; i < frames * CHANNELS; i++) {
         a.pcm[i] = (int16_t) (pcm[i] * a.gain);
     }
-    int64_t first_frame = AAudioStream_getFramesWritten(a.stream);
-    aaudio_result_t written = AAudioStream_write(a.stream, a.pcm, frames, 0);
-    a.dropped_frames += written < 0 ? frames : frames - written;
-    int64_t presented_ns = presentation_ns_locked(first_frame);
+    int n = resampler_process(&a.resampler, a.pcm, frames, a.resampled);
+    uint32_t w = atomic_load_explicit(&ring.written, memory_order_relaxed);
+    uint32_t space = RING_FRAMES - (w - atomic_load_explicit(&ring.read, memory_order_acquire));
+    int queued = n < (int) space ? n : (int) space;
+    for (int i = 0; i < queued; i++) {
+        uint32_t slot = (w + i) & (RING_FRAMES - 1);
+        ring.pcm[slot * 2] = a.resampled[i * 2];
+        ring.pcm[slot * 2 + 1] = a.resampled[i * 2 + 1];
+    }
+    atomic_store_explicit(&ring.written, w + queued, memory_order_release);
+    a.dropped_frames += n - queued;
+    /* While dry, the callback is still adding silence ahead of these frames, so they have no fixed time yet. */
+    int64_t first = a.ring_frames + atomic_load(&ring.shift);
+    a.ring_frames += queued;
+    int64_t presented_ns = atomic_load(&ring.dry) ? 0 : presentation_ns_locked(first);
     int64_t now = now_us();
     if (presented_ns) {
-        int64_t last_ns = presented_ns + (int64_t) max_i32(written, 0) * 1000000000LL / SAMPLE_RATE;
+        int64_t last_ns = presented_ns + (int64_t) queued * 1000000000LL / a.rate;
         if (a.latency_count < MAX_SAMPLES) a.latency_us[a.latency_count++] = last_ns / 1000 - now;
         if (ntp_remote) {
             atomic_store(&presented_offset_ns, presented_ns - (int64_t) ntp_remote);
@@ -217,7 +288,6 @@ static void write_pcm_locked(const int16_t *pcm, int frames, uint64_t ntp_remote
     if (now - a.stats_start_us >= 1000000) log_stats_locked(now);
 }
 
-/* The sender time rides through the decoder as the presentation time, in us. */
 static void decode_aac_locked(const uint8_t *data, int len, uint64_t ntp_remote) {
     ssize_t in = AMediaCodec_dequeueInputBuffer(a.aac, 5000);
     if (in >= 0) {
@@ -227,9 +297,10 @@ static void decode_aac_locked(const uint8_t *data, int len, uint64_t ntp_remote)
         memcpy(buffer, data, len);
         AMediaCodec_queueInputBuffer(a.aac, in, 0, len, (int64_t) (ntp_remote / 1000), 0);
     }
-    for (;;) {
+    /* Waits briefly for this packet's PCM so output leaves in the packets' rhythm, not in clumps. */
+    for (int64_t timeout_us = in >= 0 ? 10000 : 0;; timeout_us = 0) {
         AMediaCodecBufferInfo info;
-        ssize_t out = AMediaCodec_dequeueOutputBuffer(a.aac, &info, 0);
+        ssize_t out = AMediaCodec_dequeueOutputBuffer(a.aac, &info, timeout_us);
         if (out == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED || out == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
         if (out < 0) break;
         size_t size;
