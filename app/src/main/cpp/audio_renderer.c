@@ -22,7 +22,7 @@
 #define TARGET_MS 40      /* AAudio buffer */
 #define PRIME_MS 30       /* jitter buffer refilled after the ring runs dry */
 #define TRIM_MS 90        /* queued audio beyond this is cut back to PRIME_MS */
-#define RING_FRAMES 16384 /* power of two */
+#define RING_FRAMES 65536 /* power of two */
 #define MAX_PACKET_FRAMES RESAMPLER_MAX_IN
 #define MAX_OUT_FRAMES (MAX_PACKET_FRAMES * 5)
 #define MAX_SAMPLES 256
@@ -164,7 +164,10 @@ static void open_stream_locked(void) {
     AAudioStream *stream = build_stream();
     if (!stream) return;
     a.rate = AAudioStream_getSampleRate(stream);
-    if (resampler_init(&a.resampler, SAMPLE_RATE, a.rate) != 0) {
+    if (resampler_init(&a.resampler, SAMPLE_RATE, a.rate) != 0 ||
+        resampler_max_out(&a.resampler, MAX_PACKET_FRAMES) > MAX_OUT_FRAMES) {
+        LOGE("cannot play at %d Hz", a.rate);
+        resampler_free(&a.resampler);
         AAudioStream_close(stream);
         return;
     }
@@ -178,8 +181,9 @@ static void open_stream_locked(void) {
     atomic_store(&ring.shift, 0);
     atomic_store(&ring.underruns, 0);
     atomic_store(&ring.trims, 0);
-    ring.prime_frames = (uint32_t) (a.rate * PRIME_MS / 1000);
-    ring.trim_frames = (uint32_t) (a.rate * TRIM_MS / 1000);
+    /* A legacy-path callback asks for a whole burst at once, so the ring must hold more than one. */
+    ring.prime_frames = (uint32_t) max_i32(a.rate * PRIME_MS / 1000, burst);
+    ring.trim_frames = (uint32_t) max_i32(a.rate * TRIM_MS / 1000, (int32_t) ring.prime_frames + 2 * burst);
     a.ring_frames = 0;
     AAudioStream_requestStart(stream);
     LOGI("AAudio stream: %d Hz (resampled from %d), device %d, performance mode %d, burst %d, buffer %d, capacity %d",

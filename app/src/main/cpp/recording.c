@@ -29,8 +29,10 @@ void recorder_open(const char *files_dir) {
     pthread_mutex_lock(&rec.lock);
     if (!rec.file) {
         char path[512];
-        snprintf(path, sizeof(path), "%s/rec-%lld.bin", files_dir, (long long) time(NULL));
-        rec.file = fopen(path, "wb");
+        struct timespec now;
+        clock_gettime(CLOCK_REALTIME, &now);
+        snprintf(path, sizeof(path), "%s/rec-%lld%03ld.bin", files_dir, (long long) now.tv_sec, now.tv_nsec / 1000000);
+        rec.file = fopen(path, "wbx");
         if (rec.file) {
             setvbuf(rec.file, NULL, _IOFBF, 1 << 20);
             fwrite(REC_MAGIC, 1, 8, rec.file);
@@ -103,16 +105,15 @@ static void *replay_loop(void *arg) {
     uint32_t cap = 0;
     rec_header_t h;
     while (f && fread(&h, sizeof(h), 1, f) == 1) {
-        bool mine = video ? h.kind <= REC_VIDEO_RESET : h.kind >= REC_AUDIO_FORMAT;
-        if (!mine) {
-            fseek(f, h.len, SEEK_CUR);
-            continue;
-        }
         if (h.len > cap) {
+            uint8_t *grown = realloc(buf, h.len);
+            if (!grown) break;
+            buf = grown;
             cap = h.len;
-            buf = realloc(buf, cap);
         }
         if (h.len && fread(buf, 1, h.len, f) != h.len) break;
+        bool mine = video ? h.kind <= REC_VIDEO_RESET : h.kind >= REC_AUDIO_FORMAT;
+        if (!mine) continue;
         if (!sleep_until(rp.start_ns + (h.arrival_ns - rp.first_arrival))) break;
         switch (h.kind) {
             case REC_VIDEO_CODEC:
@@ -173,6 +174,7 @@ int replay_start(const receiver_config_t *cfg) {
 
 void replay_stop(void) {
     atomic_store(&rp.stop, true);
+    video_renderer_reset(); /* unblocks a replay thread waiting in video_renderer_push */
     for (int i = 0; i < rp.thread_count; i++) pthread_join(rp.threads[i], NULL);
     rp.thread_count = 0;
 }

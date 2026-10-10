@@ -15,6 +15,7 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 #define INPUT_TIMEOUT_US 10000
+#define INPUT_WAIT_LIMIT_US 1000000
 #define OUTPUT_TIMEOUT_US 10000
 #define MAX_SAMPLES 512
 
@@ -283,12 +284,19 @@ static void unlock_for_teardown(void) {
     atomic_fetch_sub(&v.teardowns, 1);
 }
 
-/* Waits for an input buffer as long as it takes: dropping an access unit corrupts every frame that
- * references it until the next IDR, and iOS sends those rarely. Gives up only for a teardown. */
+/* Waits for an input buffer, blocking the mirror thread: dropping an access unit corrupts every
+ * frame that references it until the next IDR, and iOS sends those rarely. Gives up for a teardown,
+ * or after INPUT_WAIT_LIMIT_US for a wedged decoder (UxPlay joins this thread before resetting us),
+ * and then waits for the next keyframe rather than decode from broken references. */
 static ssize_t dequeue_input_locked(void) {
-    for (;;) {
+    for (int64_t waited_us = 0;; waited_us += INPUT_TIMEOUT_US) {
         ssize_t index = AMediaCodec_dequeueInputBuffer(v.decoder, INPUT_TIMEOUT_US);
         if (index != AMEDIACODEC_INFO_TRY_AGAIN_LATER || atomic_load(&v.teardowns)) return index;
+        if (waited_us >= INPUT_WAIT_LIMIT_US) {
+            LOGE("decoder took no input for %lld ms, resuming at the next keyframe", (long long) (waited_us / 1000));
+            v.decoder_synced = false;
+            return index;
+        }
     }
 }
 

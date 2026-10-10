@@ -15,6 +15,12 @@ static int gcd(int a, int b) {
     return a;
 }
 
+static void resampler_reset(resampler_t *r) {
+    r->phase = 0;
+    r->kept = RESAMPLER_TAPS - 1;
+    memset(r->work, 0, sizeof(float) * r->kept * 2);
+}
+
 int resampler_init(resampler_t *r, int in_rate, int out_rate) {
     int g = gcd(in_rate, out_rate);
     r->up = out_rate / g;
@@ -42,12 +48,6 @@ int resampler_init(resampler_t *r, int in_rate, int out_rate) {
     }
     resampler_reset(r);
     return 0;
-}
-
-void resampler_reset(resampler_t *r) {
-    r->phase = 0;
-    r->kept = RESAMPLER_TAPS - 1;
-    memset(r->work, 0, sizeof(float) * r->kept * 2);
 }
 
 void resampler_free(resampler_t *r) {

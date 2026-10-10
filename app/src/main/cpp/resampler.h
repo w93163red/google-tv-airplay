@@ -17,7 +17,6 @@ typedef struct {
 } resampler_t;
 
 int resampler_init(resampler_t *r, int in_rate, int out_rate);
-void resampler_reset(resampler_t *r);
 void resampler_free(resampler_t *r);
 /* Upper bound on the output frames of one resampler_process call with in_frames. */
 int resampler_max_out(const resampler_t *r, int in_frames);
