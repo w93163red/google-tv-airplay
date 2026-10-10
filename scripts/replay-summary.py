@@ -83,6 +83,7 @@ def main():
     if audio:
         print(f"audio windows {len(audio)}: xruns {int(sum(w['audio xruns'] for w in audio))}"
               f" dropped_frames {int(sum(w['audio dropped_frames'] for w in audio))}"
+              f" stale {int(sum(w.get('audio stale', 0) for w in audio))}"
               f" level_ms median {statistics.median(w['audio level_ms'] for w in audio):.0f}")
         show("out_latency_ms", audio, "out_latency_ms p50", "out_latency_ms p99")
 

@@ -7,14 +7,14 @@
 
 /* Session recording file: the 8-byte magic, then records of rec_header_t followed by len payload bytes.
  * Little-endian, fixed-width fields, identical on 32- and 64-bit builds. */
-#define REC_MAGIC "AIRSREC1"
+#define REC_MAGIC "AIRSREC2"
 
 typedef enum {
     REC_VIDEO_CODEC = 1,  /* a = video_codec_t */
     REC_VIDEO = 2,        /* payload = access unit as handed to video_renderer_push */
     REC_VIDEO_RESET = 3,
     REC_AUDIO_FORMAT = 4, /* a = ct, b = spf */
-    REC_AUDIO = 5,        /* payload = packet as handed to audio_renderer_push */
+    REC_AUDIO = 5,        /* payload = packet as handed to audio_renderer_push, a = RTP timestamp */
     REC_AUDIO_FLUSH = 6,
 } rec_kind_t;
 

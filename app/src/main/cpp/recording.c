@@ -131,7 +131,7 @@ static void *replay_loop(void *arg) {
                 audio_renderer_start((unsigned char) h.a, (unsigned short) h.b);
                 break;
             case REC_AUDIO:
-                audio_renderer_push(buf, (int) h.len, h.ntp_remote);
+                audio_renderer_push(buf, (int) h.len, h.ntp_remote, h.a);
                 break;
             case REC_AUDIO_FLUSH:
                 audio_renderer_flush();
@@ -156,7 +156,7 @@ int replay_start(const receiver_config_t *cfg) {
     FILE *f = open_recording();
     rec_header_t first;
     if (!f || fread(&first, sizeof(first), 1, f) != 1) {
-        LOGE("cannot read recording %s", rp.path);
+        LOGE("cannot read recording %s (a recording older than %s needs scripts/rec-add-rtp.py)", rp.path, REC_MAGIC);
         if (f) fclose(f);
         return -1;
     }

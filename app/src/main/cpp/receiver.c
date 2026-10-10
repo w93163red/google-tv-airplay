@@ -132,8 +132,8 @@ static void audio_get_format(void *cls, unsigned char *ct, unsigned short *spf, 
 }
 
 static void audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
-    recorder_write(REC_AUDIO, data->data, (uint32_t) data->data_len, data->ntp_time_remote, 0, 0);
-    audio_renderer_push(data->data, data->data_len, data->ntp_time_remote);
+    recorder_write(REC_AUDIO, data->data, (uint32_t) data->data_len, data->ntp_time_remote, data->rtp_time, 0);
+    audio_renderer_push(data->data, data->data_len, data->ntp_time_remote, data->rtp_time);
 }
 
 static void audio_flush(void *cls) {

@@ -109,10 +109,10 @@ def main():
     for j, packet in enumerate(packets):
         t = j * SPF * 1_000_000_000 // SAMPLE_RATE
         arrival = local0 + t + network_ns + jitter()
-        events.append((arrival, record(REC_AUDIO, arrival, packet, remote0 + t)))
+        events.append((arrival, record(REC_AUDIO, arrival, packet, remote0 + t, a=j * SPF)))
     events.sort(key=lambda e: e[0])
     with open(args.out, "wb") as f:
-        f.write(b"AIRSREC1")
+        f.write(b"AIRSREC2")
         for _, rec in events:
             f.write(rec)
     print(f"{args.out}: {len(aus)} video access units, {len(packets)} audio packets")

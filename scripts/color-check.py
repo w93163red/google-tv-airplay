@@ -46,7 +46,7 @@ def read_recording(path):
     """The video access units (Annex-B) and each one's replay time in seconds."""
     units, times, first = [], [], None
     with open(path, "rb") as f:
-        assert f.read(8) == b"AIRSREC1", "not a session recording"
+        assert f.read(8) in (b"AIRSREC1", b"AIRSREC2"), "not a session recording"
         while len(head := f.read(HEADER.size)) == HEADER.size:
             kind, length, arrival, _, _, _ = HEADER.unpack(head)
             payload = f.read(length)

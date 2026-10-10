@@ -28,6 +28,8 @@
 #define MAX_SAMPLES 256
 #define OFFSET_STALE_NS 500000000LL
 #define OFFSET_SMOOTHING 16 /* packets of exponential averaging for the video schedule */
+#define STALE_NS 120000000LL /* a packet this much later than usual is dropped; steady-state jitter stays under 105 ms */
+#define MAPPING_STEP_NS 1000000LL /* a sender-time step that differs from the RTP step by more is a new sync mapping */
 
 /* PCM at the stream rate between the network thread (sole writer) and the AAudio callback (sole
  * reader). Arrival and playback run at the same rate, so whatever is queued when playback starts
@@ -59,6 +61,13 @@ static struct {
     int32_t stats_underruns;    /* ring.underruns at stats_start_us */
     int32_t stats_trims;        /* ring.trims at stats_start_us */
     int64_t dropped_frames;     /* since stats_start_us */
+    int32_t stale;              /* packets dropped as stale since stats_start_us */
+    /* How late packets arrive, to drop a backlog that the sender or UxPlay's resend wait delivers seconds late:
+     * played that late it would move the A/V offset by as much. Reset when a stream starts or flushes. */
+    bool anchored;
+    int64_t lateness_ns;        /* arrival minus sender time, averaged over played packets */
+    uint64_t last_ntp;          /* sender time and RTP time of the previous packet */
+    uint32_t last_rtp;
     int latency_count;          /* out_latency_us samples since stats_start_us */
     int64_t latency_us[MAX_SAMPLES];
     float gain;
@@ -232,16 +241,17 @@ static void log_stats_locked(int64_t now) {
         p99 = a.latency_us[(a.latency_count * 99) / 100] / 1000.0;
     }
     __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
-                        "audio xruns=%d underruns=%d trims=%d dropped_frames=%lld level_ms=%lld "
+                        "audio xruns=%d underruns=%d trims=%d dropped_frames=%lld stale=%d level_ms=%lld "
                         "out_latency_ms p50=%.1f p99=%.1f",
                         xruns - a.stats_xruns, underruns - a.stats_underruns, trims - a.stats_trims,
-                        (long long) a.dropped_frames,
+                        (long long) a.dropped_frames, a.stale,
                         (long long) (level * 1000 / a.rate), p50, p99);
     a.stats_start_us = now;
     a.stats_xruns = xruns;
     a.stats_underruns = underruns;
     a.stats_trims = trims;
     a.dropped_frames = 0;
+    a.stale = 0;
     a.latency_count = 0;
 }
 
@@ -297,6 +307,33 @@ static void write_pcm_locked(const int16_t *pcm, int frames, uint64_t ntp_remote
     if (now - a.stats_start_us >= 1000000) log_stats_locked(now);
 }
 
+/* True when the packet arrives more than STALE_NS later than the played packets did, so it would play
+ * that late. A change in UxPlay's RTP-to-sender-time mapping (its first real sync replacing the estimate
+ * it starts with) is not lateness: it moves the audio offset and the lateness average by the step at once. */
+static bool stale_locked(uint64_t ntp_remote, uint32_t rtp) {
+    if (!ntp_remote) return false;
+    int64_t lateness = airscreen_now_ns() - (int64_t) ntp_remote;
+    if (!a.anchored) {
+        a.anchored = true;
+        a.lateness_ns = lateness;
+    } else {
+        int64_t step = (int64_t) (ntp_remote - a.last_ntp) - (int64_t) (int32_t) (rtp - a.last_rtp) * 1000000000LL / SAMPLE_RATE;
+        if (llabs(step) > MAPPING_STEP_NS) {
+            LOGI("audio sender-time mapping moved %.1f ms", step / 1e6);
+            a.lateness_ns -= step;
+            atomic_fetch_sub(&smoothed_offset_ns, step);
+        }
+    }
+    a.last_ntp = ntp_remote;
+    a.last_rtp = rtp;
+    if (lateness - a.lateness_ns > STALE_NS) {
+        a.stale++;
+        return true;
+    }
+    a.lateness_ns += (lateness - a.lateness_ns) / OFFSET_SMOOTHING;
+    return false;
+}
+
 static void decode_aac_locked(const uint8_t *data, int len, uint64_t ntp_remote) {
     ssize_t in = AMediaCodec_dequeueInputBuffer(a.aac, 5000);
     if (in >= 0) {
@@ -320,9 +357,11 @@ static void decode_aac_locked(const uint8_t *data, int len, uint64_t ntp_remote)
     }
 }
 
+/* Each SETUP starts a new RTP stream with its own timestamps. */
 void audio_renderer_start(unsigned char ct, unsigned short spf) {
     if (ct == 2 && !spf) spf = 352;
     pthread_mutex_lock(&a.lock);
+    a.anchored = false;
     if (ct != a.ct || spf != a.spf) {
         stop_locked();
         if (ct == 2 && spf > MAX_PACKET_FRAMES) {
@@ -343,14 +382,16 @@ void audio_renderer_start(unsigned char ct, unsigned short spf) {
     pthread_mutex_unlock(&a.lock);
 }
 
-void audio_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
+void audio_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote, uint32_t rtp) {
     pthread_mutex_lock(&a.lock);
-    if (a.aac) {
-        decode_aac_locked(data, len, ntp_remote);
-    } else if (a.alac) {
-        int16_t out[MAX_PACKET_FRAMES * CHANNELS];
-        int frames = alac_decoder_decode(a.alac, data, len, out, a.spf);
-        write_pcm_locked(out, frames, ntp_remote);
+    if (!stale_locked(ntp_remote, rtp)) {
+        if (a.aac) {
+            decode_aac_locked(data, len, ntp_remote);
+        } else if (a.alac) {
+            int16_t out[MAX_PACKET_FRAMES * CHANNELS];
+            int frames = alac_decoder_decode(a.alac, data, len, out, a.spf);
+            write_pcm_locked(out, frames, ntp_remote);
+        }
     }
     pthread_mutex_unlock(&a.lock);
 }
@@ -374,6 +415,7 @@ void audio_renderer_set_volume(float airplay_db) {
 void audio_renderer_flush(void) {
     pthread_mutex_lock(&a.lock);
     if (a.aac) AMediaCodec_flush(a.aac);
+    a.anchored = false;
     pthread_mutex_unlock(&a.lock);
 }
 
@@ -381,5 +423,6 @@ void audio_renderer_stop(void) {
     pthread_mutex_lock(&a.lock);
     stop_locked();
     a.spf = 0;
+    a.anchored = false;
     pthread_mutex_unlock(&a.lock);
 }

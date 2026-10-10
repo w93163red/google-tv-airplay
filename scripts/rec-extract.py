@@ -15,7 +15,7 @@ counts = {}
 first = last = None
 video_arrivals = []
 with open(src, "rb") as f, open(dst, "wb") as out:
-    assert f.read(8) == b"AIRSREC1", "not a session recording"
+    assert f.read(8) in (b"AIRSREC1", b"AIRSREC2"), "not a session recording"
     while True:
         head = f.read(HEADER.size)
         if len(head) < HEADER.size:
