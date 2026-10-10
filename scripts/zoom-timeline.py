@@ -20,7 +20,7 @@ codec = "h264"
 units = []
 arrivals = []
 with open(src, "rb") as f:
-    assert f.read(8) == b"AIRSREC1", "not a session recording"
+    assert f.read(8) in (b"AIRSREC1", b"AIRSREC2"), "not a session recording"
     while head := f.read(HEADER.size):
         kind, length, arrival, _ntp, a, _b = HEADER.unpack(head)
         payload = f.read(length)
