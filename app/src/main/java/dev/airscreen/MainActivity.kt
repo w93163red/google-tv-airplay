@@ -147,6 +147,7 @@ class MainActivity : Activity() {
         val next = zoom.next(content, now)
         val changed = next.zoom != zoom.zoom
         zoom = next
+        sampler.held = next.zoom
         if (changed) {
             Log.i(TAG, "zoom ${next.zoom ?: "off"}")
             render(Receiver.state)

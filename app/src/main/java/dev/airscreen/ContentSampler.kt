@@ -23,8 +23,12 @@ class ContentSampler(private val view: SurfaceView, private val onSample: (Conte
     /** Identifies the current run; a sample from an earlier run is dropped. */
     @Volatile private var run: Any? = null
 
+    /** The rect currently zoomed to, which [LetterboxDetector] keeps while its bars hold. Main thread writes. */
+    @Volatile var held: ContentRect? = null
+
     fun start(stream: Size) {
         stop()
+        held = null
         val token = Any().also { run = it }
         val width = WIDTH
         val height = maxOf(1, (WIDTH * stream.height / stream.width.toDouble()).roundToInt())
@@ -68,7 +72,7 @@ class ContentSampler(private val view: SurfaceView, private val onSample: (Conte
     private fun detect(token: Any, bitmap: Bitmap, pixels: IntArray) {
         bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
         for (i in pixels.indices) pixels[i] = LetterboxDetector.luma(pixels[i])
-        val rect = LetterboxDetector.detect(pixels, bitmap.width, bitmap.height)
+        val rect = LetterboxDetector.detect(pixels, bitmap.width, bitmap.height, held)
         val now = SystemClock.uptimeMillis()
         main.post { if (run === token) onSample(rect, now) }
     }

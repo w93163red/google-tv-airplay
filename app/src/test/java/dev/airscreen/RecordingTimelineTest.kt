@@ -26,7 +26,7 @@ class RecordingTimelineTest {
                 stream = size
                 state = ZoomState.Idle
             }
-            val sample = LetterboxDetector.detect(luma, size.width, size.height)
+            val sample = LetterboxDetector.detect(luma, size.width, size.height, state.zoom)
             val next = state.next(sample, now)
             out.append("%6.1f s  frame %5d  %-40s  %s%s\n".format(
                 now / 1000.0, frame + 1, sample?.let(::format) ?: "dark", next::class.simpleName,
