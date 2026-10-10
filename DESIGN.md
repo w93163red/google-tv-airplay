@@ -87,7 +87,7 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
    - `Full` fits the whole stream and never crops.
    - `Smart`, the default, fits the detected picture inside letterbox or pillarbox bars to the screen, so a 16:9 video in an iPad's 4:3 stream fills the TV. Without bars, a stream wider than the screen (iPhone landscape, ~2.17:1) fills it by cropping the sides, and any other stream fits, because an iPad keeps its status bar and tab bars at the top and bottom. Bars only ever zoom in further than that rule.
 
-   While mirroring in `Smart`, `ContentSampler` copies the surface into a 96 px wide bitmap with `PixelCopy` every 500 ms on its own thread. `LetterboxDetector` reads the bars from its luma: equal pairs of black edge rows or columns, at least 2% of the axis, with a non-dark center so a dark scene never counts. The `ZoomState` machine zooms in once the same bars hold for 1.5 s and out once they show picture for 1 s, so player controls flashing over a bar do not flap it.
+   While mirroring in `Smart`, `ContentSampler` copies the surface into a 96 px wide bitmap with `PixelCopy` every 500 ms on its own thread. `LetterboxDetector` reads the bars from its luma: equal pairs of black edge rows or columns, at least 2% of the axis, with a non-dark center so a dark scene never counts. The `ZoomState` machine zooms in once the same bars hold for 1.5 s and out once they show picture for 1 s, so player controls flashing over a bar do not flap it. `scripts/zoom-timeline.py <recording> <dir>` prints those decisions over a real recording's frames.
 
 ## Verification
 
