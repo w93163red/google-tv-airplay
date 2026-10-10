@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "audio_renderer.h"
 #include "video_renderer.h"
@@ -15,54 +16,81 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 #define INPUT_TIMEOUT_US 10000
-#define INPUT_WAIT_LIMIT_US 1000000
 #define OUTPUT_TIMEOUT_US 10000
 #define MAX_SAMPLES 512
 
 #define PENDING_SLOTS 256
 #define MAX_SYNC_DELAY_NS 500000000LL
+#define QUEUE_SLOTS 64            /* the sync clamp holds at most 30 access units at 60 fps */
+#define QUEUE_BYTES (8 << 20)     /* the sync clamp holds about 2.5 MB at 40 Mbit/s */
+#define FEED_MARGIN_NS 10000000LL /* fed this much before the measured decode latency asks */
+#define LATENCY_SMOOTHING 16      /* frames of exponential averaging for the decode latency */
+#define FEED_AHEAD 3              /* access units fed beyond the frame due next, see head_due_locked */
+#define FEED_RECHECK_NS 20000000LL /* the due time follows the audio clock, so it is recomputed this often */
 
 typedef struct {
     int count;
     int64_t us[MAX_SAMPLES];
 } samples_t;
 
+/* A compressed access unit waiting for its feed time, stored at q.bytes + offset. */
+typedef struct {
+    int offset, len;
+    int64_t arrival_ns;
+    uint64_t ntp_remote;
+    bool keyframe; /* carries parameter sets, so decoding can start here */
+} access_unit_t;
+
+/* Access units from push (the only writer of the tail) to the feeder (the only reader of the head).
+ * push takes only this lock, so it never waits on the decoder. Lock order: v.lock, then q.lock. */
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t changed; /* CLOCK_MONOTONIC; the queue stopped being empty, or a teardown ended */
+    access_unit_t slots[QUEUE_SLOTS];
+    int head, count;        /* moved off the head only with v.lock held too */
+    uint8_t *bytes;         /* QUEUE_BYTES, allocated and touched once so push never allocates or faults */
+    int tail;               /* where the newest access unit's bytes end */
+    access_unit_t fed[FEED_AHEAD]; /* timing of the last access units fed, oldest at fed[fed_oldest] */
+    int fed_oldest;
+    video_codec_t codec;    /* written with both locks held; VIDEO_CODEC_UNKNOWN ignores pushes */
+    bool resyncing;         /* overflowed: dropping until the next keyframe */
+    int pushed, overflowed; /* this stats window */
+    samples_t push;         /* push call time */
+} q = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
 /* One stats window. The MediaTek decoders never fire AMediaCodec's frame-rendered callback, so
  * "presented" is the render time handed to the surface, which excludes SurfaceFlinger and the display. */
 static struct {
     pthread_mutex_t lock;
-    struct { int64_t pts_us; uint64_t remote_ns; } pending[PENDING_SLOTS]; /* queued frames by pts */
+    struct { int64_t pts_us, fed_ns; uint64_t remote_ns; } pending[PENDING_SLOTS]; /* fed frames by pts */
     int next_pending;
     int rendered;     /* released to the surface */
-    samples_t decode; /* arrival to decoded */
+    samples_t decode; /* fed to decoded */
     samples_t glass;  /* arrival to presented */
     samples_t av;     /* audio presentation minus video presentation of the same sender time */
 } t = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
-/* The decoder exists exactly when codec, window and parameter sets are all known; reconcile() keeps it so. */
+/* Smoothed fed-to-decoded time of the current decoder, 0 until its first frame. Written by the output thread. */
+static _Atomic int64_t decode_latency_ns;
+
+/* The feeder creates the decoder once codec, window and parameter sets are known; teardowns destroy it. */
 static struct {
     pthread_mutex_t lock;
-    atomic_int teardowns; /* callers waiting for lock to change the decoder; a blocked push yields to them */
+    atomic_int teardowns; /* callers waiting for lock to change the decoder; the feeder yields to them */
     uint16_t max_width, max_height;
     char *avc_name, *hevc_name;
-    video_codec_t codec;
     ANativeWindow *window;
     uint8_t *params;     /* latest VPS/SPS/PPS NALs, Annex-B */
     int params_len;
     int csd1_offset;     /* H.264: where the PPS starts inside params */
 
     AMediaCodec *decoder;
-    video_codec_t decoder_codec;
     bool decoder_synced;  /* has been fed an access unit carrying parameter sets */
     pthread_t output_thread;
     atomic_bool output_running;
     atomic_int frames_in;
     atomic_int frames_dropped;
 } v = { .lock = PTHREAD_MUTEX_INITIALIZER };
-
-static int64_t now_us(void) {
-    return airscreen_now_ns() / 1000;
-}
 
 static int compare_i64(const void *a, const void *b) {
     int64_t x = *(const int64_t *) a, y = *(const int64_t *) b;
@@ -80,42 +108,67 @@ static double percentile_ms(samples_t *s, int pct) {
     return s->us[(s->count * pct) / 100] / 1000.0;
 }
 
-static void remember_frame(int64_t pts_us, uint64_t remote_ns) {
+/* When audio plays the sender time remote, by the averaged audio offset so the schedule does not
+ * jitter, and never more than MAX_SYNC_DELAY_NS after arrival. 0 when no audio is playing. */
+static int64_t sync_target_ns(int64_t arrival_ns, uint64_t remote, int64_t *audio_offset) {
+    int64_t smoothed;
+    if (!remote || !audio_renderer_offset(audio_offset, &smoothed)) return 0;
+    int64_t target = (int64_t) remote + smoothed, latest = arrival_ns + MAX_SYNC_DELAY_NS;
+    return target > latest ? latest : target;
+}
+
+/* When the head access unit goes to the decoder: the decode latency plus a margin before its sync
+ * target. The MediaTek decoders emit a frame only after one to three later access units are fed, so
+ * it also goes no later than a margin before the target of the access unit FEED_AHEAD before it.
+ * 0 when no audio plays. */
+static int64_t head_due_locked(void) {
+    const access_unit_t *head = &q.slots[q.head], *ahead = &q.fed[q.fed_oldest];
+    int64_t audio_offset, target = sync_target_ns(head->arrival_ns, head->ntp_remote, &audio_offset);
+    if (!target) return 0;
+    int64_t due = target - atomic_load(&decode_latency_ns) - FEED_MARGIN_NS;
+    int64_t ahead_target = sync_target_ns(ahead->arrival_ns, ahead->ntp_remote, &audio_offset);
+    return ahead_target && ahead_target - FEED_MARGIN_NS < due ? ahead_target - FEED_MARGIN_NS : due;
+}
+
+static void remember_frame(int64_t pts_us, uint64_t remote_ns, int64_t fed_ns) {
     pthread_mutex_lock(&t.lock);
     t.pending[t.next_pending].pts_us = pts_us;
+    t.pending[t.next_pending].fed_ns = fed_ns;
     t.pending[t.next_pending].remote_ns = remote_ns;
     t.next_pending = (t.next_pending + 1) % PENDING_SLOTS;
     pthread_mutex_unlock(&t.lock);
 }
 
-static uint64_t frame_remote_locked(int64_t pts_us) {
-    for (int i = 0; i < PENDING_SLOTS; i++) {
-        if (t.pending[i].pts_us == pts_us) return t.pending[i].remote_ns;
-    }
-    return 0;
-}
-
-/* When to show a frame (pts_us is its local arrival time): when audio plays the same sender time,
- * using the averaged audio offset so the schedule does not jitter, never before now and never more
- * than MAX_SYNC_DELAY_NS after arrival. With no audio playing, now. Records the frame's stats. */
+/* When to show a decoded frame (pts_us is its local arrival time): its sync target, or now when
+ * that has passed or no audio is playing. Updates the decode latency and records the frame's stats. */
 static int64_t schedule_frame(int64_t pts_us, int64_t decoded_ns) {
-    int64_t audio_offset, smoothed_offset, present_ns = decoded_ns;
+    int64_t present_ns = decoded_ns;
     pthread_mutex_lock(&t.lock);
-    uint64_t remote = frame_remote_locked(pts_us);
-    bool audio = remote && audio_renderer_offset(&audio_offset, &smoothed_offset);
-    if (audio) {
-        int64_t target = (int64_t) remote + smoothed_offset, latest = pts_us * 1000 + MAX_SYNC_DELAY_NS;
-        present_ns = target < decoded_ns ? decoded_ns : target > latest ? latest : target;
-        add_sample(&t.av, ((int64_t) remote + audio_offset - present_ns) / 1000);
+    for (int i = 0; i < PENDING_SLOTS; i++) {
+        if (t.pending[i].pts_us != pts_us) continue;
+        int64_t audio_offset, remote = (int64_t) t.pending[i].remote_ns;
+        int64_t target = sync_target_ns(pts_us * 1000, (uint64_t) remote, &audio_offset);
+        if (target) {
+            if (target > decoded_ns) present_ns = target;
+            add_sample(&t.av, (remote + audio_offset - present_ns) / 1000);
+        }
+        int64_t latency = decoded_ns - t.pending[i].fed_ns, smoothed = atomic_load(&decode_latency_ns);
+        atomic_store(&decode_latency_ns, smoothed ? smoothed + (latency - smoothed) / LATENCY_SMOOTHING : latency);
+        add_sample(&t.decode, latency / 1000);
+        break;
     }
     t.rendered++;
-    add_sample(&t.decode, decoded_ns / 1000 - pts_us);
     add_sample(&t.glass, present_ns / 1000 - pts_us);
     pthread_mutex_unlock(&t.lock);
     return present_ns;
 }
 
 static void log_stats(void) {
+    pthread_mutex_lock(&q.lock);
+    int pushed = q.pushed, overflowed = q.overflowed;
+    samples_t push = q.push;
+    q.pushed = q.overflowed = q.push.count = 0;
+    pthread_mutex_unlock(&q.lock);
     pthread_mutex_lock(&t.lock);
     int rendered = t.rendered;
     samples_t decode = t.decode, glass = t.glass, av = t.av;
@@ -125,10 +178,13 @@ static void log_stats(void) {
     double av_p50 = percentile_ms(&av, 50);
     for (int i = 0; i < av.count; i++) av.us[i] = llabs(av.us[i]);
     __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
-                        "in=%d rendered=%d dropped=%d decode_ms p50=%.1f p99=%.1f "
-                        "glass_ms p50=%.1f p99=%.1f av_offset_ms n=%d p50=%.1f abs_p99=%.1f",
-                        atomic_exchange(&v.frames_in, 0), rendered, atomic_exchange(&v.frames_dropped, 0),
+                        "pushed=%d in=%d rendered=%d dropped=%d overflow=%d push_ms p50=%.2f p99=%.2f "
+                        "decode_ms p50=%.1f p99=%.1f lead=%.1f glass_ms p50=%.1f p99=%.1f "
+                        "av_offset_ms n=%d p50=%.1f abs_p99=%.1f",
+                        pushed, atomic_exchange(&v.frames_in, 0), rendered, atomic_exchange(&v.frames_dropped, 0),
+                        overflowed, percentile_ms(&push, 50), percentile_ms(&push, 99),
                         percentile_ms(&decode, 50), percentile_ms(&decode, 99),
+                        (atomic_load(&decode_latency_ns) + FEED_MARGIN_NS) / 1e6,
                         percentile_ms(&glass, 50), percentile_ms(&glass, 99),
                         av.count, av_p50, percentile_ms(&av, 99));
 }
@@ -150,21 +206,21 @@ static void report_size(AMediaCodec *decoder) {
 /* Releases every frame to the surface as soon as it is decoded, timed by schedule_frame. Never takes v.lock. */
 static void *output_loop(void *arg) {
     AMediaCodec *decoder = arg;
-    int64_t window_start = now_us();
+    int64_t window_start = airscreen_now_ns();
     while (atomic_load(&v.output_running)) {
         AMediaCodecBufferInfo info;
         ssize_t index = AMediaCodec_dequeueOutputBuffer(decoder, &info, OUTPUT_TIMEOUT_US);
-        int64_t now = now_us();
+        int64_t now = airscreen_now_ns();
         if (index >= 0) {
             if (info.size > 0) {
-                AMediaCodec_releaseOutputBufferAtTime(decoder, index, schedule_frame(info.presentationTimeUs, now * 1000));
+                AMediaCodec_releaseOutputBufferAtTime(decoder, index, schedule_frame(info.presentationTimeUs, now));
             } else {
                 AMediaCodec_releaseOutputBuffer(decoder, index, false);
             }
         } else if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
             report_size(decoder);
         }
-        if (now - window_start >= 1000000) {
+        if (now - window_start >= 1000000000LL) {
             log_stats();
             window_start = now;
         }
@@ -182,9 +238,9 @@ static void destroy_decoder_locked(void) {
     LOGI("video decoder released");
 }
 
-static void create_decoder_locked(void) {
-    const char *mime = v.codec == VIDEO_CODEC_H265 ? "video/hevc" : "video/avc";
-    const char *by_name = v.codec == VIDEO_CODEC_H265 ? v.hevc_name : v.avc_name;
+static void create_decoder_locked(video_codec_t codec) {
+    const char *mime = codec == VIDEO_CODEC_H265 ? "video/hevc" : "video/avc";
+    const char *by_name = codec == VIDEO_CODEC_H265 ? v.hevc_name : v.avc_name;
     AMediaCodec *decoder = by_name ? AMediaCodec_createCodecByName(by_name) : NULL;
     if (!decoder) decoder = AMediaCodec_createDecoderByType(mime);
     if (!decoder) {
@@ -218,16 +274,10 @@ static void create_decoder_locked(void) {
     LOGI("video decoder %s started for %s, max %dx%d", name ? name : "?", mime, v.max_width, v.max_height);
     if (name) AMediaCodec_releaseName(decoder, name);
     v.decoder = decoder;
-    v.decoder_codec = v.codec;
     v.decoder_synced = false;
+    atomic_store(&decode_latency_ns, 0);
     atomic_store(&v.output_running, true);
     pthread_create(&v.output_thread, NULL, output_loop, decoder);
-}
-
-static void reconcile_locked(void) {
-    bool wanted = v.codec != VIDEO_CODEC_UNKNOWN && v.window && v.params_len > 0;
-    if (v.decoder && (!wanted || v.decoder_codec != v.codec)) destroy_decoder_locked();
-    if (!v.decoder && wanted) create_decoder_locked();
 }
 
 static void clear_params_locked(void) {
@@ -237,41 +287,130 @@ static void clear_params_locked(void) {
     v.csd1_offset = 0;
 }
 
-/* Keeps the parameter-set NALs of an access unit (UxPlay emits 4-byte start codes) for decoder (re)creation.
- * Returns whether the access unit carries parameter sets. */
-static bool capture_params_locked(const uint8_t *data, int len) {
-    bool hevc = v.codec == VIDEO_CODEC_H265;
-    uint8_t *params = NULL;
-    int params_len = 0, csd1_offset = 0;
-    int i = 0;
+/* UxPlay prepends a keyframe's parameter-set NALs, with 4-byte start codes. Returns where they end,
+ * 0 when the access unit carries none; *start is where they begin and *pps where the H.264 PPS
+ * begins, relative to *start. */
+static int leading_params(const uint8_t *data, int len, bool hevc, int *start, int *pps) {
+    int i = 0, begin = -1, pps_at = 0;
     while (i + 4 < len) {
         if (data[i] || data[i + 1] || data[i + 2] || data[i + 3] != 1) {
             i++;
             continue;
         }
-        int start = i + 4;
-        int type = hevc ? (data[start] >> 1) & 0x3f : data[start] & 0x1f;
-        bool is_param = hevc ? (type >= 32 && type <= 34) : (type == 7 || type == 8);
-        if (!is_param) break;  /* UxPlay prepends parameter sets, so the slices need no scan */
-        int end = start;
+        int type = hevc ? (data[i + 4] >> 1) & 0x3f : data[i + 4] & 0x1f;
+        if (!(hevc ? type >= 32 && type <= 34 : type == 7 || type == 8)) break;
+        if (begin < 0) begin = i;
+        if (!hevc && type == 8 && !pps_at) pps_at = i - begin;
+        int end = i + 4;
         while (end + 3 < len && !(data[end] == 0 && data[end + 1] == 0 && data[end + 2] == 0 && data[end + 3] == 1)) end++;
-        if (end + 3 >= len) end = len;
-        params = realloc(params, params_len + (end - i));
-        if (!hevc && type == 8 && !csd1_offset) csd1_offset = params_len;
-        memcpy(params + params_len, data + i, end - i);
-        params_len += end - i;
-        i = end;
+        i = end + 3 >= len ? len : end;
     }
-    if (!params_len) return false;
-    if (params_len == v.params_len && !memcmp(params, v.params, params_len)) {
-        free(params);
-        return true;
-    }
+    if (begin < 0) return 0;
+    if (start) *start = begin;
+    if (pps) *pps = pps_at;
+    return i;
+}
+
+/* Keeps a keyframe's parameter-set NALs for decoder creation. */
+static void capture_params_locked(const uint8_t *data, int len, bool hevc) {
+    int start = 0, pps = 0, end = leading_params(data, len, hevc, &start, &pps);
+    int params_len = end - start;
+    if (!end || (params_len == v.params_len && !memcmp(data + start, v.params, params_len))) return;
+    uint8_t *params = malloc(params_len);
+    if (!params) return;
+    memcpy(params, data + start, params_len);
     clear_params_locked();
     v.params = params;
     v.params_len = params_len;
-    v.csd1_offset = csd1_offset;
+    v.csd1_offset = pps;
+}
+
+/* Hands an access unit to the decoder, creating the decoder first when it can. Waits for an input
+ * buffer rather than drop it: a lost access unit corrupts every frame that references it until the
+ * next keyframe. Returns false, leaving the access unit queued, when a teardown wants v.lock. */
+static bool feed_locked(const access_unit_t *au, video_codec_t codec) {
+    const uint8_t *data = q.bytes + au->offset;
+    if (au->keyframe) capture_params_locked(data, au->len, codec == VIDEO_CODEC_H265);
+    if (!v.decoder && v.window && v.params_len > 0) create_decoder_locked(codec);
+    if (v.decoder && au->keyframe) v.decoder_synced = true;
+    /* A new decoder starts at a keyframe instead of on reference-less P-frames, which some decoders
+     * hold forever without returning input buffers. */
+    if (!v.decoder || !v.decoder_synced) {
+        atomic_fetch_add(&v.frames_dropped, 1);
+        return true;
+    }
+    ssize_t index;
+    for (int waited_ms = 0;; waited_ms += INPUT_TIMEOUT_US / 1000) {
+        if (atomic_load(&v.teardowns)) return false;
+        index = AMediaCodec_dequeueInputBuffer(v.decoder, INPUT_TIMEOUT_US);
+        if (index != AMEDIACODEC_INFO_TRY_AGAIN_LATER) break;
+        if (waited_ms == 1000) LOGE("decoder took no input for 1 s, still waiting");
+    }
+    size_t capacity = 0;
+    uint8_t *buffer = index >= 0 ? AMediaCodec_getInputBuffer(v.decoder, index, &capacity) : NULL;
+    int64_t pts_us = au->arrival_ns / 1000;
+    if (buffer && capacity >= (size_t) au->len) {
+        memcpy(buffer, data, au->len);
+        remember_frame(pts_us, au->ntp_remote, airscreen_now_ns());
+        AMediaCodec_queueInputBuffer(v.decoder, index, 0, au->len, pts_us, 0);
+        atomic_fetch_add(&v.frames_in, 1);
+    } else {
+        if (buffer) AMediaCodec_queueInputBuffer(v.decoder, index, 0, 0, pts_us, 0);
+        atomic_fetch_add(&v.frames_dropped, 1);
+    }
     return true;
+}
+
+/* Feeds the queued access units in order, each when head_due_locked says, so frames wait here
+ * instead of holding the decoder's output buffers. Runs for the life of the process. */
+static void *feed_loop(void *arg) {
+    for (;;) {
+        pthread_mutex_lock(&q.lock);
+        for (;;) {
+            if (atomic_load(&v.teardowns) || !q.count) {
+                pthread_cond_wait(&q.changed, &q.lock);
+                continue;
+            }
+            int64_t due = head_due_locked(), now = airscreen_now_ns();
+            if (due <= now) break;
+            if (due > now + FEED_RECHECK_NS) due = now + FEED_RECHECK_NS;
+            struct timespec deadline = { .tv_sec = (time_t) (due / 1000000000), .tv_nsec = (long) (due % 1000000000) };
+            pthread_cond_timedwait(&q.changed, &q.lock, &deadline);
+        }
+        pthread_mutex_unlock(&q.lock);
+
+        pthread_mutex_lock(&v.lock);
+        pthread_mutex_lock(&q.lock);
+        /* A teardown may have emptied and refilled the queue between the two locks. */
+        bool due = q.count && !atomic_load(&v.teardowns) && head_due_locked() <= airscreen_now_ns();
+        access_unit_t *au = due ? &q.slots[q.head] : NULL;
+        video_codec_t codec = q.codec;
+        pthread_mutex_unlock(&q.lock);
+        /* push never writes the head slot, and only teardowns, which need v.lock, empty the queue */
+        if (au && feed_locked(au, codec)) {
+            pthread_mutex_lock(&q.lock);
+            q.fed[q.fed_oldest] = *au;
+            q.fed_oldest = (q.fed_oldest + 1) % FEED_AHEAD;
+            q.head = (q.head + 1) % QUEUE_SLOTS;
+            q.count--;
+            pthread_mutex_unlock(&q.lock);
+        }
+        pthread_mutex_unlock(&v.lock);
+    }
+    return NULL;
+}
+
+static void start_feeder(void) {
+    q.bytes = malloc(QUEUE_BYTES);
+    if (q.bytes) memset(q.bytes, 0, QUEUE_BYTES);
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&q.changed, &attr);
+    pthread_condattr_destroy(&attr);
+    pthread_t feeder;
+    pthread_create(&feeder, NULL, feed_loop, NULL);
+    pthread_detach(feeder);
 }
 
 static void lock_for_teardown(void) {
@@ -282,25 +421,26 @@ static void lock_for_teardown(void) {
 static void unlock_for_teardown(void) {
     pthread_mutex_unlock(&v.lock);
     atomic_fetch_sub(&v.teardowns, 1);
+    pthread_mutex_lock(&q.lock);
+    pthread_cond_broadcast(&q.changed);
+    pthread_mutex_unlock(&q.lock);
 }
 
-/* Waits for an input buffer, blocking the mirror thread: dropping an access unit corrupts every
- * frame that references it until the next IDR, and iOS sends those rarely. Gives up for a teardown,
- * or after INPUT_WAIT_LIMIT_US for a wedged decoder (UxPlay joins this thread before resetting us),
- * and then waits for the next keyframe rather than decode from broken references. */
-static ssize_t dequeue_input_locked(void) {
-    for (int64_t waited_us = 0;; waited_us += INPUT_TIMEOUT_US) {
-        ssize_t index = AMediaCodec_dequeueInputBuffer(v.decoder, INPUT_TIMEOUT_US);
-        if (index != AMEDIACODEC_INFO_TRY_AGAIN_LATER || atomic_load(&v.teardowns)) return index;
-        if (waited_us >= INPUT_WAIT_LIMIT_US) {
-            LOGE("decoder took no input for %lld ms, resuming at the next keyframe", (long long) (waited_us / 1000));
-            v.decoder_synced = false;
-            return index;
-        }
-    }
+/* Ends the current stream: no decoder, no parameter sets, an empty queue. */
+static void restart_locked(video_codec_t codec) {
+    destroy_decoder_locked();
+    clear_params_locked();
+    pthread_mutex_lock(&q.lock);
+    q.codec = codec;
+    q.head = q.count = 0;
+    q.resyncing = false;
+    memset(q.fed, 0, sizeof(q.fed));
+    pthread_mutex_unlock(&q.lock);
 }
 
 void video_renderer_init(const receiver_config_t *cfg) {
+    static pthread_once_t feeder_once = PTHREAD_ONCE_INIT;
+    pthread_once(&feeder_once, start_feeder);
     pthread_mutex_lock(&v.lock);
     v.max_width = cfg->width;
     v.max_height = cfg->height;
@@ -318,57 +458,71 @@ void video_renderer_set_window(ANativeWindow *window) {
         if (v.window) ANativeWindow_release(v.window);
         v.window = window;
         if (window) ANativeWindow_acquire(window);
-        reconcile_locked();
     }
     unlock_for_teardown();
 }
 
 void video_renderer_set_codec(video_codec_t codec) {
     lock_for_teardown();
-    if (codec != v.codec) {
-        clear_params_locked();
-        v.codec = codec;
-        reconcile_locked();
-    }
+    if (codec != q.codec) restart_locked(codec);
     unlock_for_teardown();
 }
 
 void video_renderer_reset(void) {
     lock_for_teardown();
-    v.codec = VIDEO_CODEC_UNKNOWN;
-    clear_params_locked();
-    reconcile_locked();
+    restart_locked(VIDEO_CODEC_UNKNOWN);
     unlock_for_teardown();
 }
 
+/* Where len bytes fit in q.bytes after the queued access units, -1 when they do not. An access
+ * unit stays contiguous: one that does not fit before the end of the buffer starts at 0. */
+static int free_offset_locked(int len) {
+    if (!q.bytes || len > QUEUE_BYTES) return -1;
+    if (!q.count) return 0;
+    int head = q.slots[q.head].offset;
+    if (q.tail > head) return q.tail + len <= QUEUE_BYTES ? q.tail : len <= head ? 0 : -1;
+    return q.tail + len <= head ? q.tail : -1;
+}
+
+/* Queues the access unit for the feeder and returns. When the queue is full the access unit is
+ * dropped, and so is everything after it up to the next keyframe, which is what it references. */
 void video_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
-    int64_t arrival_us = now_us();
+    int64_t arrival_ns = airscreen_now_ns();
     /* UxPlay sets data[0] = 1 on packets that failed decryption or NAL parsing. */
     if (len < 5 || data[0]) {
         atomic_fetch_add(&v.frames_dropped, 1);
         return;
     }
-    pthread_mutex_lock(&v.lock);
-    if (v.codec == VIDEO_CODEC_UNKNOWN) {
-        pthread_mutex_unlock(&v.lock);
+    pthread_mutex_lock(&q.lock);
+    if (q.codec == VIDEO_CODEC_UNKNOWN) {
+        pthread_mutex_unlock(&q.lock);
         return;
     }
-    bool keyframe = capture_params_locked(data, len);
-    reconcile_locked();
-    if (v.decoder && keyframe) v.decoder_synced = true;
-    /* A decoder recreated mid-session (new surface) starts at the next keyframe instead of on
-     * reference-less P-frames, which some decoders hold forever without returning input buffers. */
-    ssize_t index = v.decoder && v.decoder_synced ? dequeue_input_locked() : -1;
-    size_t capacity = 0;
-    uint8_t *buffer = index >= 0 ? AMediaCodec_getInputBuffer(v.decoder, index, &capacity) : NULL;
-    if (buffer && capacity >= (size_t) len) {
-        memcpy(buffer, data, len);
-        remember_frame(arrival_us, ntp_remote);
-        AMediaCodec_queueInputBuffer(v.decoder, index, 0, len, arrival_us, 0);
-        atomic_fetch_add(&v.frames_in, 1);
+    bool keyframe = leading_params(data, len, q.codec == VIDEO_CODEC_H265, NULL, NULL) > 0;
+    bool wake = false;
+    int offset = q.count < QUEUE_SLOTS && (keyframe || !q.resyncing) ? free_offset_locked(len) : -1;
+    if (offset >= 0) {
+        access_unit_t *au = &q.slots[(q.head + q.count) % QUEUE_SLOTS];
+        memcpy(q.bytes + offset, data, len);
+        q.tail = offset + len;
+        au->offset = offset;
+        au->len = len;
+        au->arrival_ns = arrival_ns;
+        au->ntp_remote = ntp_remote;
+        au->keyframe = keyframe;
+        wake = q.count++ == 0;
+        q.resyncing = false;
+        q.pushed++;
     } else {
-        if (buffer) AMediaCodec_queueInputBuffer(v.decoder, index, 0, 0, now_us(), 0);
-        atomic_fetch_add(&v.frames_dropped, 1);
+        if (!q.resyncing) LOGE("video queue full (%d access units), dropping until the next keyframe", q.count);
+        q.resyncing = true;
+        q.overflowed++;
     }
-    pthread_mutex_unlock(&v.lock);
+    pthread_mutex_unlock(&q.lock);
+    /* Signaled outside the lock so the feeder cannot wake into it while push still holds it. */
+    if (wake) pthread_cond_signal(&q.changed);
+    int64_t took_us = (airscreen_now_ns() - arrival_ns) / 1000;
+    pthread_mutex_lock(&q.lock);
+    add_sample(&q.push, took_us);
+    pthread_mutex_unlock(&q.lock);
 }

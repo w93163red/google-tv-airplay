@@ -97,7 +97,7 @@ static FILE *open_recording(void) {
     return f;
 }
 
-/* One thread per stream, as in a live session, so a blocked video push never delays audio. */
+/* One thread per stream, as in a live session, so a video decoder teardown never delays audio. */
 static void *replay_loop(void *arg) {
     bool video = arg != NULL;
     FILE *f = open_recording();
@@ -174,7 +174,6 @@ int replay_start(const receiver_config_t *cfg) {
 
 void replay_stop(void) {
     atomic_store(&rp.stop, true);
-    video_renderer_reset(); /* unblocks a replay thread waiting in video_renderer_push */
     for (int i = 0; i < rp.thread_count; i++) pthread_join(rp.threads[i], NULL);
     rp.thread_count = 0;
 }
