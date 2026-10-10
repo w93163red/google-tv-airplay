@@ -123,7 +123,8 @@ class MainActivity : Activity() {
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         val s = Receiver.state
         val confirm = keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
-        if (!confirm || s !is ReceiverState.Mirroring || s.width <= 0 || s.height > s.width) {
+        val parent = surface.parent as View
+        if (!confirm || s !is ReceiverState.Mirroring || !fillApplies(parent.width, parent.height, s.width, s.height)) {
             return super.onKeyDown(keyCode, event)
         }
         if (event.repeatCount == 0) toggleLandscapeScale()

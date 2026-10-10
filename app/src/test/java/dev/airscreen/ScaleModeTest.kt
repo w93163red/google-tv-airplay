@@ -17,9 +17,18 @@ class ScaleModeTest {
     }
 
     @Test
-    fun narrowerThanScreenStream() {
+    fun narrowerThanScreenStreamAlwaysFits() {
         assertEquals(Size(1440, 1080), streamViewSize(1920, 1080, 1024, 768, ScaleMode.Fit))
-        assertEquals(Size(1920, 1440), streamViewSize(1920, 1080, 1024, 768, ScaleMode.Fill))
+        assertEquals(Size(1440, 1080), streamViewSize(1920, 1080, 1024, 768, ScaleMode.Fill))
+        assertEquals(Size(1442, 1080), streamViewSize(1920, 1080, 1442, 1080, ScaleMode.Fill))
+    }
+
+    @Test
+    fun onlyStreamsWiderThanTheScreenCanFill() {
+        assertEquals(true, fillApplies(1920, 1080, 1920, 886))
+        assertEquals(false, fillApplies(1920, 1080, 1442, 1080))
+        assertEquals(false, fillApplies(1920, 1080, 886, 1920))
+        assertEquals(false, fillApplies(1920, 1080, 1920, 1080))
     }
 
     @Test
