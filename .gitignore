@@ -8,3 +8,4 @@ local.properties
 third_party/prebuilt/
 third_party/.cache/
 decisions.tsv
+.claude/
