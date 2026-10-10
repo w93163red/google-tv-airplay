@@ -31,6 +31,7 @@
 #define AUDIO_SLEW_NS_PER_S 100000000LL /* the delay follows audio at one refresh in ten at 60 Hz */
 #define IDLE_SLEW_NS_PER_S 20000000LL   /* and leaves it at one in fifty */
 #define AUDIO_HOLD_NS 20000000000LL     /* covers the 14 s between two YouTube videos in the live session */
+#define IDLE_HOLD_REFRESHES 4 /* without audio, a frame may arrive this late behind the envelope and keep its spacing */
 
 typedef struct {
     int count;
@@ -82,16 +83,19 @@ static _Atomic int64_t decode_latency_ns;
 
 /* The earliest an access unit arrives relative to its sender time: the lowest arrival minus sender time,
  * rising at ENVELOPE_RISE_NS_PER_S so clock drift and a slower network path catch up with it. Plus the
- * decode latency, it is the timeline's delay without audio: a frame on the envelope shows as soon as it
- * decodes. INT64_MAX before the first access unit. Written by push under q.lock. */
+ * decode latency and the idle hold, it is the timeline's delay without audio. INT64_MAX before the first
+ * access unit. Written by push under q.lock. */
 static _Atomic int64_t arrival_envelope_ns = INT64_MAX;
 
 /* Render time minus sender time for every frame. It moves toward its goal at a bounded rate, so the
  * delay never steps when audio starts or stops: frames are spread or bunched by at most a refresh in
  * ten. The goal is the averaged audio offset while audio plays and for AUDIO_HOLD_NS after it stops
- * (pauses, seeks and video switches), and otherwise the arrival envelope plus the decode latency. */
+ * (pauses, seeks and video switches), and otherwise the arrival envelope plus the decode latency plus
+ * hold_ns. The hold is a fixed offset, not a per-frame wait behind the previous frame, so it cannot chain
+ * up when the sender's frame period is a little shorter than the display's. */
 static struct {
     pthread_mutex_t lock;
+    int64_t hold_ns;       /* IDLE_HOLD_REFRESHES display refreshes */
     bool started;          /* delay_ns is set; cleared when the stream restarts */
     int64_t delay_ns, moved_ns;
     bool heard;            /* audio has played since the stream started */
@@ -146,7 +150,7 @@ static int64_t timeline_delay_ns(int64_t envelope) {
         goal = timeline.audio_ns;
         rate = AUDIO_SLEW_NS_PER_S;
     } else {
-        goal = envelope + atomic_load(&decode_latency_ns);
+        goal = envelope + atomic_load(&decode_latency_ns) + timeline.hold_ns;
         rate = IDLE_SLEW_NS_PER_S;
     }
     if (!timeline.started) {
@@ -512,6 +516,9 @@ void video_renderer_init(const receiver_config_t *cfg) {
     v.avc_name = cfg->avc_decoder ? strdup(cfg->avc_decoder) : NULL;
     v.hevc_name = cfg->hevc_decoder ? strdup(cfg->hevc_decoder) : NULL;
     pthread_mutex_unlock(&v.lock);
+    pthread_mutex_lock(&timeline.lock);
+    timeline.hold_ns = IDLE_HOLD_REFRESHES * 1000000000LL / (cfg->refresh_hz ? cfg->refresh_hz : 60);
+    pthread_mutex_unlock(&timeline.lock);
 }
 
 void video_renderer_set_window(ANativeWindow *window) {
