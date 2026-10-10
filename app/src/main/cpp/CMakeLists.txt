@@ -12,7 +12,7 @@ file(GLOB UX_SRC ${UX}/*.c ${UX}/playfair/*.c ${UX}/llhttp/*.c)
 file(GLOB PLIST_SRC ${TP}/libplist/src/*.c)
 set(CNARY_SRC ${TP}/libplist/libcnary/node.c ${TP}/libplist/libcnary/node_list.c)
 file(GLOB ALAC_SRC ${TP}/alac/*.c ${TP}/alac/*.cpp)
-file(GLOB APP_SRC ${CMAKE_CURRENT_SOURCE_DIR}/*.c ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+file(GLOB APP_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.c ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 
 add_library(crypto_static STATIC IMPORTED)
 set_target_properties(crypto_static PROPERTIES IMPORTED_LOCATION ${PREBUILT}/lib/libcrypto.a)

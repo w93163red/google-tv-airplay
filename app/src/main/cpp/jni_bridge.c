@@ -65,3 +65,28 @@ JNIEXPORT jint JNI_OnLoad(JavaVM *jvm, void *reserved) {
     pthread_key_create(&detach_key, detach_thread);
     return JNI_VERSION_1_6;
 }
+
+JNIEXPORT jint JNICALL
+Java_dev_airscreen_Native_nativeStart(JNIEnv *env, jclass cls, jstring name, jbyteArray hw_addr,
+                                      jint width, jint height, jint refresh_hz, jint max_fps,
+                                      jboolean h265, jstring keyfile) {
+    receiver_config_t cfg = {
+        .name = (*env)->GetStringUTFChars(env, name, NULL),
+        .width = (uint16_t) width,
+        .height = (uint16_t) height,
+        .refresh_hz = (uint16_t) refresh_hz,
+        .max_fps = (uint16_t) max_fps,
+        .h265 = h265,
+        .keyfile = (*env)->GetStringUTFChars(env, keyfile, NULL),
+    };
+    (*env)->GetByteArrayRegion(env, hw_addr, 0, sizeof(cfg.hw_addr), (jbyte *) cfg.hw_addr);
+    int result = receiver_start(&cfg);
+    (*env)->ReleaseStringUTFChars(env, name, cfg.name);
+    (*env)->ReleaseStringUTFChars(env, keyfile, cfg.keyfile);
+    return result;
+}
+
+JNIEXPORT void JNICALL
+Java_dev_airscreen_Native_nativeStop(JNIEnv *env, jclass cls) {
+    receiver_stop();
+}
