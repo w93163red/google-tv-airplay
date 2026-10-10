@@ -29,6 +29,9 @@
 #define FEED_RECHECK_NS 20000000LL /* the due time follows the audio clock, so it is recomputed this often */
 #define ENVELOPE_RISE_NS_PER_S 5000000LL /* how fast the arrival envelope forgets an early frame */
 #define SPREAD_REFRESHES 2         /* a frame waits at most this long for a vsync of its own */
+#define AUDIO_SLEW_NS_PER_S 100000000LL /* the delay follows audio at one refresh in ten at 60 Hz */
+#define IDLE_SLEW_NS_PER_S 30000000LL   /* and leaves it at one in thirty */
+#define AUDIO_HOLD_NS 20000000000LL     /* covers the 14 s between two YouTube videos in the live session */
 
 typedef struct {
     int count;
@@ -85,6 +88,18 @@ static _Atomic int64_t decode_latency_ns;
  * the network's bunching. INT64_MAX before the first access unit. Written by push under q.lock. */
 static _Atomic int64_t arrival_envelope_ns = INT64_MAX;
 
+/* Render time minus sender time for every frame. It moves toward its goal at a bounded rate, so the
+ * delay never steps when audio starts or stops: frames are spread or bunched by at most a refresh in
+ * ten. The goal is the averaged audio offset while audio plays and for AUDIO_HOLD_NS after it stops
+ * (pauses, seeks and video switches), and otherwise the arrival envelope plus the decode latency. */
+static struct {
+    pthread_mutex_t lock;
+    bool started;          /* delay_ns is set; cleared when the stream restarts */
+    int64_t delay_ns, moved_ns;
+    bool heard;            /* audio has played since the stream started */
+    int64_t audio_ns, heard_ns; /* the latest averaged audio offset and when it was read */
+} timeline = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
 /* The feeder creates the decoder once codec, window and parameter sets are known; teardowns destroy it. */
 static struct {
     pthread_mutex_t lock;
@@ -121,17 +136,43 @@ static double percentile_ms(samples_t *s, int pct) {
     return s->us[(s->count * pct) / 100] / 1000.0;
 }
 
-/* When to show the frame with sender time remote. While audio plays: when audio plays that sender
- * time, by the averaged audio offset so the schedule does not jitter, and never more than
- * MAX_SYNC_DELAY_NS after arrival. Otherwise: by the arrival envelope plus the decode latency.
- * 0 when the sender time is unknown. */
-static int64_t sync_target_ns(int64_t arrival_ns, uint64_t remote) {
-    int64_t latest_audio, smoothed, envelope = atomic_load(&arrival_envelope_ns);
-    if (!remote || envelope == INT64_MAX) return 0;
-    if (!audio_renderer_offset(&latest_audio, &smoothed)) {
-        return (int64_t) remote + envelope + atomic_load(&decode_latency_ns);
+static int64_t timeline_delay_ns(int64_t envelope) {
+    int64_t now = airscreen_now_ns(), latest_audio, smoothed, goal, rate;
+    bool audio = audio_renderer_offset(&latest_audio, &smoothed);
+    pthread_mutex_lock(&timeline.lock);
+    if (audio) {
+        timeline.heard = true;
+        timeline.heard_ns = now;
+        timeline.audio_ns = smoothed;
     }
-    int64_t target = (int64_t) remote + smoothed, latest = arrival_ns + MAX_SYNC_DELAY_NS;
+    if (timeline.heard && now - timeline.heard_ns < AUDIO_HOLD_NS) {
+        goal = timeline.audio_ns;
+        rate = AUDIO_SLEW_NS_PER_S;
+    } else {
+        goal = envelope + atomic_load(&decode_latency_ns);
+        rate = IDLE_SLEW_NS_PER_S;
+    }
+    if (!timeline.started) {
+        timeline.started = true;
+        timeline.delay_ns = goal;
+        timeline.moved_ns = now;
+    } else if (now > timeline.moved_ns) {
+        int64_t elapsed = now - timeline.moved_ns < 1000000000LL ? now - timeline.moved_ns : 1000000000LL;
+        int64_t most = elapsed * (rate / 1000000) / 1000, change = goal - timeline.delay_ns;
+        timeline.delay_ns += change > most ? most : change < -most ? -most : change;
+        timeline.moved_ns = now;
+    }
+    int64_t delay = timeline.delay_ns;
+    pthread_mutex_unlock(&timeline.lock);
+    return delay;
+}
+
+/* When to show the frame with sender time remote: by the timeline, and never more than
+ * MAX_SYNC_DELAY_NS after arrival. 0 when the sender time is unknown. */
+static int64_t sync_target_ns(int64_t arrival_ns, uint64_t remote) {
+    int64_t envelope = atomic_load(&arrival_envelope_ns);
+    if (!remote || envelope == INT64_MAX) return 0;
+    int64_t target = (int64_t) remote + timeline_delay_ns(envelope), latest = arrival_ns + MAX_SYNC_DELAY_NS;
     return target > latest ? latest : target;
 }
 
@@ -180,6 +221,8 @@ static int64_t schedule_frame(int64_t pts_us, int64_t decoded_ns) {
     if (present_ns < next_vsync - v.refresh_ns / 32 && next_vsync <= present_ns + SPREAD_REFRESHES * v.refresh_ns) {
         present_ns = next_vsync;
         t.spread++;
+    } else if (present_ns < t.last_present_ns) {
+        present_ns = t.last_present_ns; /* released out of order, it would cost a repeat as well as a drop */
     }
     t.last_present_ns = present_ns;
     int64_t audio_offset, smoothed;
@@ -464,6 +507,9 @@ static void restart_locked(video_codec_t codec) {
     memset(q.fed, 0, sizeof(q.fed));
     atomic_store(&arrival_envelope_ns, INT64_MAX);
     pthread_mutex_unlock(&q.lock);
+    pthread_mutex_lock(&timeline.lock);
+    timeline.started = timeline.heard = false;
+    pthread_mutex_unlock(&timeline.lock);
 }
 
 void video_renderer_init(const receiver_config_t *cfg) {
@@ -541,7 +587,8 @@ void video_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
         au->keyframe = keyframe;
         if (ntp_remote) {
             int64_t envelope = atomic_load(&arrival_envelope_ns), lag = arrival_ns - (int64_t) ntp_remote;
-            if (envelope != INT64_MAX) envelope += (arrival_ns - q.envelope_at) / 1000 * ENVELOPE_RISE_NS_PER_S / 1000000;
+            int64_t elapsed = arrival_ns - q.envelope_at < 1000000000LL ? arrival_ns - q.envelope_at : 1000000000LL;
+            if (envelope != INT64_MAX) envelope += elapsed * (ENVELOPE_RISE_NS_PER_S / 1000000) / 1000;
             if (lag < envelope) envelope = lag;
             atomic_store(&arrival_envelope_ns, envelope);
             q.envelope_at = arrival_ns;
