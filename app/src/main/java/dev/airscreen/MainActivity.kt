@@ -94,6 +94,8 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        // Receiver renders only to started activities, so this one would never see the session end.
+        sampleForBars(null)
         Receiver.onStop(this)
         super.onStop()
     }

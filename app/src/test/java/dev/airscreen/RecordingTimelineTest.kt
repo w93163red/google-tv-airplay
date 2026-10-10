@@ -7,7 +7,7 @@ import org.junit.Test
 
 /**
  * Replays the zoom decisions over a real recording's frames, sampled every 500 ms as the app does. Runs only
- * when AIRSCREEN_FRAMES names a directory from `scripts/zoom-timeline.sh`, and writes timeline.txt there.
+ * when AIRSCREEN_FRAMES names a directory from `scripts/zoom-timeline.py`, and writes timeline.txt there.
  */
 class RecordingTimelineTest {
     @Test
@@ -29,19 +29,12 @@ class RecordingTimelineTest {
             val sample = LetterboxDetector.detect(luma, size.width, size.height)
             val next = state.next(sample, now)
             out.append("%6.1f s  frame %5d  %-40s  %s%s\n".format(
-                now / 1000.0, frame + 1, sample?.let(::format) ?: "dark", label(next),
+                now / 1000.0, frame + 1, sample?.let(::format) ?: "dark", next::class.simpleName,
                 if (next.zoom != state.zoom) "   <== ${if (next.zoom != null) "ZOOM IN" else "ZOOM OUT"}" else "",
             ))
             state = next
         }
         File(dir, "timeline.txt").writeText(out.toString())
-    }
-
-    private fun label(state: ZoomState) = when (state) {
-        ZoomState.Idle -> "Idle"
-        is ZoomState.Candidate -> "Candidate"
-        is ZoomState.Zoomed -> "Zoomed"
-        is ZoomState.ZoomedLeaving -> "ZoomedLeaving"
     }
 
     private fun format(r: ContentRect) =
