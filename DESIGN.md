@@ -57,7 +57,7 @@ Kotlin picks width, height, and `h265` from the real display mode and decoder ca
 
 ### Fixed network ports
 
-Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7000 (RTSP/HTTP, also the AirPlay port) and 7100 (mirror data). UDP 6000 (timing), 6001 (control), 7011 (audio data). These match UxPlay's `-p` defaults.
+Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7000 (RTSP/HTTP, also the AirPlay port) and 7100 (mirror data). UDP 7011 (timing), 6001 (control), 6000 (audio data). These match UxPlay's `-p` defaults.
 
 ## Native module boundaries (`app/src/main/cpp`)
 
