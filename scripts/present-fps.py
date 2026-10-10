@@ -70,4 +70,5 @@ def main():
               f"max {max(ms):6.1f}  >1 refresh {repeats:3d}  >2 refresh {hitches:3d}  (refresh {period / 1e6:.2f} ms)")
 
 
+sys.stdout.reconfigure(line_buffering=True)
 main()
