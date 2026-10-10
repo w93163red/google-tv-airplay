@@ -4,11 +4,13 @@
 #include <media/NdkMediaCodec.h>
 #include <pthread.h>
 #include <string.h>
+#include <time.h>
 
 #include "alac_decoder.h"
 #include "audio_renderer.h"
 
 #define TAG "AirScreen"
+#define STATS_TAG "AirScreenStats"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -26,6 +28,10 @@ static struct {
     AMediaCodec *aac;
     alac_decoder_t *alac;
     AAudioStream *stream;
+    int32_t prime_frames;       /* silence written when the stream has run dry */
+    int64_t stats_start_us;
+    int32_t stats_xruns;        /* AAudio xrun count at stats_start_us */
+    int64_t dropped_frames;     /* since stats_start_us */
     float gain;
     int16_t pcm[MAX_PACKET_FRAMES * CHANNELS];
 } a = { .lock = PTHREAD_MUTEX_INITIALIZER, .gain = 1.0f };
@@ -57,7 +63,15 @@ static AMediaCodec *create_aac(unsigned char ct) {
     return codec;
 }
 
-static AAudioStream *open_stream(void) {
+static int64_t now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t) ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static int32_t max_i32(int32_t x, int32_t y) { return x > y ? x : y; }
+
+static AAudioStream *build_stream(int32_t capacity) {
     AAudioStreamBuilder *builder;
     if (AAudio_createStreamBuilder(&builder) != AAUDIO_OK) return NULL;
     AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_PCM_I16);
@@ -66,7 +80,7 @@ static AAudioStream *open_stream(void) {
     AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     AAudioStreamBuilder_setUsage(builder, AAUDIO_USAGE_MEDIA);
     AAudioStreamBuilder_setContentType(builder, AAUDIO_CONTENT_TYPE_MUSIC);
-    AAudioStreamBuilder_setBufferCapacityInFrames(builder, MAX_BUFFER_FRAMES * 2);
+    AAudioStreamBuilder_setBufferCapacityInFrames(builder, capacity);
     AAudioStream *stream = NULL;
     aaudio_result_t result = AAudioStreamBuilder_openStream(builder, &stream);
     AAudioStreamBuilder_delete(builder);
@@ -74,12 +88,33 @@ static AAudioStream *open_stream(void) {
         LOGE("AAudio open failed: %s", AAudio_convertResultToText(result));
         return NULL;
     }
-    AAudioStream_setBufferSizeInFrames(stream, MAX_BUFFER_FRAMES);
-    AAudioStream_requestStart(stream);
-    LOGI("AAudio stream: %d Hz, burst %d, buffer %d, performance mode %d",
-         AAudioStream_getSampleRate(stream), AAudioStream_getFramesPerBurst(stream),
-         AAudioStream_getBufferSizeInFrames(stream), AAudioStream_getPerformanceMode(stream));
     return stream;
+}
+
+/* Buffer at least three bursts: without a fast mixer the burst can be as large as
+ * MAX_BUFFER_FRAMES, and a one-burst buffer underruns on every scheduling hiccup. */
+static void open_stream_locked(void) {
+    AAudioStream *stream = build_stream(MAX_BUFFER_FRAMES * 2);
+    if (!stream) return;
+    int32_t burst = AAudioStream_getFramesPerBurst(stream);
+    int32_t size = max_i32(MAX_BUFFER_FRAMES, 3 * burst);
+    if (AAudioStream_getBufferCapacityInFrames(stream) < size) {
+        AAudioStream_close(stream);
+        stream = build_stream(size * 2);
+        if (!stream) return;
+        burst = AAudioStream_getFramesPerBurst(stream);
+        size = max_i32(MAX_BUFFER_FRAMES, 3 * burst);
+    }
+    AAudioStream_setBufferSizeInFrames(stream, size);
+    AAudioStream_requestStart(stream);
+    LOGI("AAudio stream: %d Hz, burst %d, buffer %d, capacity %d, performance mode %d",
+         AAudioStream_getSampleRate(stream), burst, AAudioStream_getBufferSizeInFrames(stream),
+         AAudioStream_getBufferCapacityInFrames(stream), AAudioStream_getPerformanceMode(stream));
+    a.stream = stream;
+    a.prime_frames = max_i32(JITTER_FRAMES, burst);
+    a.stats_start_us = now_us();
+    a.stats_xruns = 0;
+    a.dropped_frames = 0;
 }
 
 static void stop_locked(void) {
@@ -100,8 +135,28 @@ static void stop_locked(void) {
     a.ct = 0;
 }
 
-/* Plays immediately; when the stream has run dry, primes it with JITTER_FRAMES of silence
- * so network jitter does not cause an underrun per packet. Frames beyond the cap are dropped. */
+static void write_silence_locked(int frames) {
+    static const int16_t silence[MAX_PACKET_FRAMES * CHANNELS];
+    while (frames > 0) {
+        int n = frames < MAX_PACKET_FRAMES ? frames : MAX_PACKET_FRAMES;
+        AAudioStream_write(a.stream, silence, n, 0);
+        frames -= n;
+    }
+}
+
+static void log_stats_locked(int64_t now) {
+    int32_t xruns = AAudioStream_getXRunCount(a.stream);
+    int64_t level = AAudioStream_getFramesWritten(a.stream) - AAudioStream_getFramesRead(a.stream);
+    __android_log_print(ANDROID_LOG_INFO, STATS_TAG, "audio xruns=%d dropped_frames=%lld level_ms=%lld",
+                        xruns - a.stats_xruns, (long long) a.dropped_frames,
+                        (long long) (level * 1000 / SAMPLE_RATE));
+    a.stats_start_us = now;
+    a.stats_xruns = xruns;
+    a.dropped_frames = 0;
+}
+
+/* Plays immediately; when the stream has run dry, primes it with prime_frames of silence
+ * so network jitter does not cause an underrun per packet. Frames that do not fit are dropped. */
 static void write_pcm_locked(const int16_t *pcm, int frames) {
     if (frames <= 0) return;
     if (a.stream && AAudioStream_getState(a.stream) == AAUDIO_STREAM_STATE_DISCONNECTED) {
@@ -109,18 +164,18 @@ static void write_pcm_locked(const int16_t *pcm, int frames) {
         AAudioStream_close(a.stream);
         a.stream = NULL;
     }
-    if (!a.stream) a.stream = open_stream();
+    if (!a.stream) open_stream_locked();
     if (!a.stream) return;
     if (frames > MAX_PACKET_FRAMES) frames = MAX_PACKET_FRAMES;
     int64_t level = AAudioStream_getFramesWritten(a.stream) - AAudioStream_getFramesRead(a.stream);
-    if (level <= 0) {
-        static const int16_t silence[JITTER_FRAMES * CHANNELS];
-        AAudioStream_write(a.stream, silence, JITTER_FRAMES, 0);
-    }
+    if (level <= 0) write_silence_locked(a.prime_frames);
     for (int i = 0; i < frames * CHANNELS; i++) {
         a.pcm[i] = (int16_t) (pcm[i] * a.gain);
     }
-    AAudioStream_write(a.stream, a.pcm, frames, 0);
+    aaudio_result_t written = AAudioStream_write(a.stream, a.pcm, frames, 0);
+    a.dropped_frames += written < 0 ? frames : frames - written;
+    int64_t now = now_us();
+    if (now - a.stats_start_us >= 1000000) log_stats_locked(now);
 }
 
 static void decode_aac_locked(const uint8_t *data, int len) {
@@ -161,7 +216,7 @@ void audio_renderer_start(unsigned char ct, unsigned short spf) {
         if (a.alac || a.aac) {
             a.ct = ct;
             a.spf = spf;
-            a.stream = open_stream();
+            open_stream_locked();
         }
     }
     pthread_mutex_unlock(&a.lock);
