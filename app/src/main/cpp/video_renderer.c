@@ -65,6 +65,7 @@ static struct {
     struct { int64_t pts_us, fed_ns; uint64_t remote_ns; } pending[PENDING_SLOTS]; /* fed frames by pts */
     int next_pending;
     int rendered;     /* released to the surface */
+    int late;         /* decoded after their sync target */
     samples_t decode; /* fed to decoded */
     samples_t glass;  /* arrival to presented */
     samples_t av;     /* audio presentation minus video presentation of the same sender time */
@@ -150,6 +151,7 @@ static int64_t schedule_frame(int64_t pts_us, int64_t decoded_ns) {
         int64_t target = sync_target_ns(pts_us * 1000, (uint64_t) remote, &audio_offset);
         if (target) {
             if (target > decoded_ns) present_ns = target;
+            else t.late++;
             add_sample(&t.av, (remote + audio_offset - present_ns) / 1000);
         }
         int64_t latency = decoded_ns - t.pending[i].fed_ns, smoothed = atomic_load(&decode_latency_ns);
@@ -170,18 +172,18 @@ static void log_stats(void) {
     q.pushed = q.overflowed = q.push.count = 0;
     pthread_mutex_unlock(&q.lock);
     pthread_mutex_lock(&t.lock);
-    int rendered = t.rendered;
+    int rendered = t.rendered, late = t.late;
     samples_t decode = t.decode, glass = t.glass, av = t.av;
-    t.rendered = 0;
+    t.rendered = t.late = 0;
     t.decode.count = t.glass.count = t.av.count = 0;
     pthread_mutex_unlock(&t.lock);
     double av_p50 = percentile_ms(&av, 50);
     for (int i = 0; i < av.count; i++) av.us[i] = llabs(av.us[i]);
     __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
-                        "pushed=%d in=%d rendered=%d dropped=%d overflow=%d push_ms p50=%.2f p99=%.2f "
+                        "pushed=%d in=%d rendered=%d late=%d dropped=%d overflow=%d push_ms p50=%.2f p99=%.2f "
                         "decode_ms p50=%.1f p99=%.1f lead=%.1f glass_ms p50=%.1f p99=%.1f "
                         "av_offset_ms n=%d p50=%.1f abs_p99=%.1f",
-                        pushed, atomic_exchange(&v.frames_in, 0), rendered, atomic_exchange(&v.frames_dropped, 0),
+                        pushed, atomic_exchange(&v.frames_in, 0), rendered, late, atomic_exchange(&v.frames_dropped, 0),
                         overflowed, percentile_ms(&push, 50), percentile_ms(&push, 99),
                         percentile_ms(&decode, 50), percentile_ms(&decode, 99),
                         (atomic_load(&decode_latency_ns) + FEED_MARGIN_NS) / 1e6,
