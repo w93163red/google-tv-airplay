@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Builds a synthetic AirScreen session recording (see app/src/main/cpp/recording.h).
 
-Video is H.264 from Apple's VideoToolbox encoder (the encoder family iOS mirroring uses), one IDR at
+Video is a test pattern that flashes white while the audio beeps, for 100 ms each second, as
+H.264 from Apple's VideoToolbox encoder (the encoder family iOS mirroring uses), one IDR at
 the start, parameter sets prepended to it and 4-byte start codes, as UxPlay hands them over. Audio is
 AAC-LC (ct=4, 1024 samples per packet): ffmpeg cannot write AAC-ELD with the 480-sample frames
 mirroring uses. Arrival times follow the sender clock plus a fixed network delay and random jitter.
@@ -83,10 +84,11 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         h264, aac = os.path.join(tmp, "v.h264"), os.path.join(tmp, "a.aac")
-        ffmpeg("-f", "lavfi", "-i", f"testsrc2=size={args.size}:rate={args.fps}:duration={args.seconds}",
+        # The picture flashes white for the first 100 ms of every second, when the audio beeps: an A/V sync check by eye or camera.
+        ffmpeg("-f", "lavfi", "-i", f"testsrc2=size={args.size}:rate={args.fps}:duration={args.seconds},"
+               "drawbox=color=white:t=fill:enable='lt(mod(t,1),0.1)'",
                "-c:v", "h264_videotoolbox", "-realtime", "1", "-profile:v", "high", "-level", args.level, "-bf", "0",
                "-g", str(args.fps * args.seconds), "-b:v", "8M", "-bsf:v", "h264_mp4toannexb", h264)
-        # A 1 kHz beep for 100 ms at the start of every second, aligned with the video's second counter.
         ffmpeg("-f", "lavfi", "-i",
                f"sine=frequency=1000:sample_rate={SAMPLE_RATE}:duration={args.seconds},"
                "volume='if(lt(mod(t,1),0.1),1,0)':eval=frame",
