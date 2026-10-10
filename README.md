@@ -150,4 +150,4 @@ It includes or links this third-party code:
 
 ## Trademarks
 
-AirPlay, iPhone, iPad, and Mac are trademarks of Apple Inc. This project is not affiliated with or endorsed by Apple Inc.
+AirPlay, iPhone, iPad, and Mac are trademarks of Apple Inc.
