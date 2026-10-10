@@ -6,7 +6,7 @@ the start, parameter sets prepended to it and 4-byte start codes, as UxPlay hand
 AAC-LC (ct=4, 1024 samples per packet): ffmpeg cannot write AAC-ELD with the 480-sample frames
 mirroring uses. Arrival times follow the sender clock plus a fixed network delay and random jitter.
 
-usage: synth-recording.py OUT.bin [--seconds 60] [--fps 30] [--size 1920x886] [--jitter-ms 8]
+usage: synth-recording.py OUT.bin [--seconds 60] [--fps 30] [--size 1920x886] [--level 40] [--jitter-ms 8]
 """
 import argparse
 import os
@@ -77,13 +77,14 @@ def main():
     p.add_argument("--seconds", type=int, default=60)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--size", default="1920x886")
+    p.add_argument("--level", default="40", help="H.264 level_idc, e.g. 40 or 51")
     p.add_argument("--jitter-ms", type=float, default=8)
     args = p.parse_args()
 
     with tempfile.TemporaryDirectory() as tmp:
         h264, aac = os.path.join(tmp, "v.h264"), os.path.join(tmp, "a.aac")
         ffmpeg("-f", "lavfi", "-i", f"testsrc2=size={args.size}:rate={args.fps}:duration={args.seconds}",
-               "-c:v", "h264_videotoolbox", "-realtime", "1", "-profile:v", "high", "-bf", "0",
+               "-c:v", "h264_videotoolbox", "-realtime", "1", "-profile:v", "high", "-level", args.level, "-bf", "0",
                "-g", str(args.fps * args.seconds), "-b:v", "8M", "-bsf:v", "h264_mp4toannexb", h264)
         # A 1 kHz beep for 100 ms at the start of every second, aligned with the video's second counter.
         ffmpeg("-f", "lavfi", "-i",

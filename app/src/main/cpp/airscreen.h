@@ -10,6 +10,7 @@ typedef struct {
     uint8_t hw_addr[6];
     uint16_t width, height, refresh_hz, max_fps;
     bool h265;
+    const char *avc_decoder, *hevc_decoder; /* MediaCodec names, NULL to pick by type */
     const char *keyfile;
     const char *files_dir;  /* session recordings go here */
     const char *replay;     /* non-NULL: replay this recording instead of serving AirPlay */

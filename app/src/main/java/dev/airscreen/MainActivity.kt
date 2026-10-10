@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
+import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.net.ConnectivityManager
 import android.os.Build
@@ -11,6 +12,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
@@ -90,10 +92,10 @@ class MainActivity : Activity(), Native.Sink {
         val name = deviceName()
         idle = ReceiverState.Advertising(name, ipAddress())
         Native.sink = this
-        val (width, height, refresh, h265) = displayConfig()
+        val config = displayConfig()
         val result = Native.nativeStart(
-            name, hwAddr(), width, height, refresh, min(refresh, 60), h265,
-            File(filesDir, "airplay.pem").path, filesDir.path, replayPath(),
+            name, hwAddr(), config.width, config.height, config.refreshHz, min(config.refreshHz, 60),
+            config.avcDecoder, config.hevcDecoder, File(filesDir, "airplay.pem").path, filesDir.path, replayPath(),
         )
         if (result != 0) dispatch(NativeEvent.Failed("AirPlay 服务启动失败 ($result)"))
     }
@@ -197,30 +199,35 @@ class MainActivity : Activity(), Native.Sink {
         return addr
     }
 
-    private data class DisplayConfig(val width: Int, val height: Int, val refreshHz: Int, val h265: Boolean)
+    private data class DisplayConfig(
+        val width: Int, val height: Int, val refreshHz: Int, val avcDecoder: String?, val hevcDecoder: String?,
+    )
 
     private fun displayConfig(): DisplayConfig {
         val mode = display!!.mode
-        val width = max(mode.physicalWidth, mode.physicalHeight)
-        val height = min(mode.physicalWidth, mode.physicalHeight)
-        val refresh = mode.refreshRate.roundToInt()
-        if (hardwareDecoderSupports("video/hevc", width, height)) {
-            return DisplayConfig(width, height, refresh, true)
-        }
-        if (hardwareDecoderSupports("video/avc", width, height)) {
-            return DisplayConfig(width, height, refresh, false)
-        }
-        return DisplayConfig(1920, 1080, refresh, false)
+        val native = Size(max(mode.physicalWidth, mode.physicalHeight), min(mode.physicalWidth, mode.physicalHeight))
+        val size = if (MIMES.any { hardwareDecoder(it, native) != null }) native else Size(1920, 1080)
+        val (avc, hevc) = MIMES.map { hardwareDecoder(it, size) }
+        Log.i(TAG, "video decoders: avc $avc, hevc $hevc")
+        return DisplayConfig(size.width, size.height, mode.refreshRate.roundToInt(), avc, hevc)
     }
 
-    private fun hardwareDecoderSupports(mime: String, width: Int, height: Int): Boolean =
-        MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.any { info ->
-            !info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it == mime } &&
-                info.getCapabilitiesForType(mime).videoCapabilities.isSizeSupported(width, height)
+    /** The hardware decoder for [mime] at [size], preferring one that declares FEATURE_LowLatency. */
+    private fun hardwareDecoder(mime: String, size: Size): String? {
+        val decoders = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { info ->
+            !info.isEncoder && info.isHardwareAccelerated && mime in info.supportedTypes &&
+                info.getCapabilitiesForType(mime).videoCapabilities.isSizeSupported(size.width, size.height)
         }
+        val lowLatency = decoders.firstOrNull {
+            it.getCapabilitiesForType(mime).isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+        }
+        return (lowLatency ?: decoders.firstOrNull())?.name
+    }
 
     private companion object {
+        const val TAG = "AirScreen"
         const val PREF_LANDSCAPE_SCALE = "landscape_scale"
+        val MIMES = listOf("video/avc", "video/hevc")
     }
 }
 

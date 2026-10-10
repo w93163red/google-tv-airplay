@@ -80,14 +80,17 @@ static void release_utf(JNIEnv *env, jstring s, const char *chars) {
 JNIEXPORT jint JNICALL
 Java_dev_airscreen_Native_nativeStart(JNIEnv *env, jclass cls, jstring name, jbyteArray hw_addr,
                                       jint width, jint height, jint refresh_hz, jint max_fps,
-                                      jboolean h265, jstring keyfile, jstring files_dir, jstring replay) {
+                                      jstring avc_decoder, jstring hevc_decoder, jstring keyfile,
+                                      jstring files_dir, jstring replay) {
     receiver_config_t cfg = {
         .name = utf(env, name),
         .width = (uint16_t) width,
         .height = (uint16_t) height,
         .refresh_hz = (uint16_t) refresh_hz,
         .max_fps = (uint16_t) max_fps,
-        .h265 = h265,
+        .h265 = hevc_decoder != NULL,
+        .avc_decoder = utf(env, avc_decoder),
+        .hevc_decoder = utf(env, hevc_decoder),
         .keyfile = utf(env, keyfile),
         .files_dir = utf(env, files_dir),
         .replay = utf(env, replay),
@@ -95,6 +98,8 @@ Java_dev_airscreen_Native_nativeStart(JNIEnv *env, jclass cls, jstring name, jby
     (*env)->GetByteArrayRegion(env, hw_addr, 0, sizeof(cfg.hw_addr), (jbyte *) cfg.hw_addr);
     int result = cfg.replay ? replay_start(&cfg) : receiver_start(&cfg);
     release_utf(env, name, cfg.name);
+    release_utf(env, avc_decoder, cfg.avc_decoder);
+    release_utf(env, hevc_decoder, cfg.hevc_decoder);
     release_utf(env, keyfile, cfg.keyfile);
     release_utf(env, files_dir, cfg.files_dir);
     release_utf(env, replay, cfg.replay);

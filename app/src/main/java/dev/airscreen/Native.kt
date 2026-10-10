@@ -21,12 +21,14 @@ object Native {
         System.loadLibrary("airscreen")
     }
 
-    /** With [replay] set, plays that session recording through the renderers instead of serving AirPlay. */
+    /**
+     * Decoder names are MediaCodec codec names, null when there is none; HEVC is advertised only with one.
+     * With [replay] set, plays that session recording through the renderers instead of serving AirPlay.
+     */
     @JvmStatic
     external fun nativeStart(
-        name: String, hwAddr: ByteArray, width: Int, height: Int,
-        refreshHz: Int, maxFps: Int, h265: Boolean, keyfile: String,
-        filesDir: String, replay: String?,
+        name: String, hwAddr: ByteArray, width: Int, height: Int, refreshHz: Int, maxFps: Int,
+        avcDecoder: String?, hevcDecoder: String?, keyfile: String, filesDir: String, replay: String?,
     ): Int
 
     @JvmStatic

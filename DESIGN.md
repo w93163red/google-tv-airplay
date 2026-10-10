@@ -49,11 +49,14 @@ typedef struct {
     uint8_t hw_addr[6];        /* stable per-install MAC-like id */
     uint16_t width, height, refresh_hz, max_fps;
     bool h265;                 /* advertise feature bit 42 */
+    const char *avc_decoder, *hevc_decoder;  /* MediaCodec names, NULL to pick by type */
     const char *keyfile;       /* persisted ed25519 key path in app files dir */
+    const char *files_dir;     /* session recordings */
+    const char *replay;        /* debug: replay this recording instead of serving AirPlay */
 } receiver_config_t;
 ```
 
-Kotlin picks width, height, and `h265` from the real display mode and decoder capabilities. On the Streamer that is 3840x2160@60 with HEVC. On the emulator it is 1920x1080 H.264.
+Kotlin picks width, height, and the decoders from the real display mode and decoder capabilities: per MIME type the hardware decoder that declares `FEATURE_LowLatency`, else the first hardware decoder. `h265` is set when an HEVC decoder exists. On the Streamer that is 3840x2160@60 with HEVC. On the emulator it is 1920x1080 H.264.
 
 ### Fixed network ports
 
@@ -73,7 +76,7 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
 ## Latency rules
 
 1. Decoder format sets `low-latency=1`, `priority=0`, `max-width` and `max-height` to the advertised display so rotation and resolution changes reconfigure without a new codec.
-2. Input is queued from the network callback as soon as it arrives. No reordering buffer, no pacing.
+2. Input is queued from the network callback as soon as it arrives. No reordering buffer, no pacing. An access unit is never dropped because the decoder is busy: the mirror thread blocks until an input buffer frees up, so TCP backpressure slows the sender instead of a lost reference frame corrupting the picture until the next IDR.
 3. Output is released with `render=true` as soon as it is dequeued. No presentation-time scheduling.
 4. Audio output uses AAudio `PERFORMANCE_MODE_LOW_LATENCY` and a small jitter buffer.
 5. The `SurfaceView` (not `TextureView`) keeps the stream aspect ratio. Portrait streams fit inside the screen on black. Landscape streams fill the screen by default (centered, overflow cropped), because iOS sends landscape at the phone's ~2.17:1 and already pillarboxes 16:9 video inside it; the remote's OK button toggles fill and fit, persisted.

@@ -14,7 +14,7 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define INPUT_TIMEOUT_US 50000
+#define INPUT_TIMEOUT_US 10000
 #define OUTPUT_TIMEOUT_US 10000
 #define MAX_SAMPLES 512
 
@@ -40,7 +40,9 @@ static struct {
 /* The decoder exists exactly when codec, window and parameter sets are all known; reconcile() keeps it so. */
 static struct {
     pthread_mutex_t lock;
+    atomic_int teardowns; /* callers waiting for lock to change the decoder; a blocked push yields to them */
     uint16_t max_width, max_height;
+    char *avc_name, *hevc_name;
     video_codec_t codec;
     ANativeWindow *window;
     uint8_t *params;     /* latest VPS/SPS/PPS NALs, Annex-B */
@@ -172,7 +174,9 @@ static void destroy_decoder_locked(void) {
 
 static void create_decoder_locked(void) {
     const char *mime = v.codec == VIDEO_CODEC_H265 ? "video/hevc" : "video/avc";
-    AMediaCodec *decoder = AMediaCodec_createDecoderByType(mime);
+    const char *by_name = v.codec == VIDEO_CODEC_H265 ? v.hevc_name : v.avc_name;
+    AMediaCodec *decoder = by_name ? AMediaCodec_createCodecByName(by_name) : NULL;
+    if (!decoder) decoder = AMediaCodec_createDecoderByType(mime);
     if (!decoder) {
         LOGE("no decoder for %s", mime);
         return;
@@ -260,15 +264,38 @@ static bool capture_params_locked(const uint8_t *data, int len) {
     return true;
 }
 
+static void lock_for_teardown(void) {
+    atomic_fetch_add(&v.teardowns, 1);
+    pthread_mutex_lock(&v.lock);
+}
+
+static void unlock_for_teardown(void) {
+    pthread_mutex_unlock(&v.lock);
+    atomic_fetch_sub(&v.teardowns, 1);
+}
+
+/* Waits for an input buffer as long as it takes: dropping an access unit corrupts every frame that
+ * references it until the next IDR, and iOS sends those rarely. Gives up only for a teardown. */
+static ssize_t dequeue_input_locked(void) {
+    for (;;) {
+        ssize_t index = AMediaCodec_dequeueInputBuffer(v.decoder, INPUT_TIMEOUT_US);
+        if (index != AMEDIACODEC_INFO_TRY_AGAIN_LATER || atomic_load(&v.teardowns)) return index;
+    }
+}
+
 void video_renderer_init(const receiver_config_t *cfg) {
     pthread_mutex_lock(&v.lock);
     v.max_width = cfg->width;
     v.max_height = cfg->height;
+    free(v.avc_name);
+    free(v.hevc_name);
+    v.avc_name = cfg->avc_decoder ? strdup(cfg->avc_decoder) : NULL;
+    v.hevc_name = cfg->hevc_decoder ? strdup(cfg->hevc_decoder) : NULL;
     pthread_mutex_unlock(&v.lock);
 }
 
 void video_renderer_set_window(ANativeWindow *window) {
-    pthread_mutex_lock(&v.lock);
+    lock_for_teardown();
     if (window != v.window) {
         destroy_decoder_locked();
         if (v.window) ANativeWindow_release(v.window);
@@ -276,25 +303,25 @@ void video_renderer_set_window(ANativeWindow *window) {
         if (window) ANativeWindow_acquire(window);
         reconcile_locked();
     }
-    pthread_mutex_unlock(&v.lock);
+    unlock_for_teardown();
 }
 
 void video_renderer_set_codec(video_codec_t codec) {
-    pthread_mutex_lock(&v.lock);
+    lock_for_teardown();
     if (codec != v.codec) {
         clear_params_locked();
         v.codec = codec;
         reconcile_locked();
     }
-    pthread_mutex_unlock(&v.lock);
+    unlock_for_teardown();
 }
 
 void video_renderer_reset(void) {
-    pthread_mutex_lock(&v.lock);
+    lock_for_teardown();
     v.codec = VIDEO_CODEC_UNKNOWN;
     clear_params_locked();
     reconcile_locked();
-    pthread_mutex_unlock(&v.lock);
+    unlock_for_teardown();
 }
 
 void video_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
@@ -314,7 +341,7 @@ void video_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
     if (v.decoder && keyframe) v.decoder_synced = true;
     /* A decoder recreated mid-session (new surface) starts at the next keyframe instead of on
      * reference-less P-frames, which some decoders hold forever without returning input buffers. */
-    ssize_t index = v.decoder && v.decoder_synced ? AMediaCodec_dequeueInputBuffer(v.decoder, INPUT_TIMEOUT_US) : -1;
+    ssize_t index = v.decoder && v.decoder_synced ? dequeue_input_locked() : -1;
     size_t capacity = 0;
     uint8_t *buffer = index >= 0 ? AMediaCodec_getInputBuffer(v.decoder, index, &capacity) : NULL;
     if (buffer && capacity >= (size_t) len) {
