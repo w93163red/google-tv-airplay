@@ -75,7 +75,7 @@ Fixed ports make emulator forwarding and firewall reasoning deterministic. TCP 7
 2. Input is queued from the network callback as soon as it arrives. No reordering buffer, no pacing.
 3. Output is released with `render=true` as soon as it is dequeued. No presentation-time scheduling.
 4. Audio output uses AAudio `PERFORMANCE_MODE_LOW_LATENCY` and a small jitter buffer.
-5. The `SurfaceView` (not `TextureView`) is sized to the stream aspect ratio, letterboxed on black.
+5. The `SurfaceView` (not `TextureView`) keeps the stream aspect ratio. Portrait streams fit inside the screen on black. Landscape streams fill the screen by default (centered, overflow cropped), because iOS sends landscape at the phone's ~2.17:1 and already pillarboxes 16:9 video inside it; the remote's OK button toggles fill and fit, persisted.
 
 ## Verification
 

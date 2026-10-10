@@ -12,6 +12,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -34,12 +35,17 @@ class MainActivity : Activity(), Native.Sink {
     private lateinit var title: TextView
     private lateinit var subtitle: TextView
     private lateinit var hint: TextView
+    private lateinit var scaleHint: TextView
+    private val hideScaleHint = Runnable { scaleHint.visibility = View.GONE }
 
     private var state: ReceiverState = ReceiverState.Starting
     private var idle = ReceiverState.Advertising("", "")
+    private var landscapeScale = ScaleMode.Fill
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        landscapeScale = prefs().getString(PREF_LANDSCAPE_SCALE, null)
+            ?.let { saved -> ScaleMode.entries.firstOrNull { it.name == saved } } ?: ScaleMode.Fill
         advertiser = ServiceAdvertiser(this)
         surface = AspectSurfaceView(this)
         surface.holder.addCallback(object : SurfaceHolder.Callback {
@@ -50,6 +56,11 @@ class MainActivity : Activity(), Native.Sink {
         title = text(40f)
         subtitle = text(22f)
         hint = text(22f)
+        scaleHint = text(28f).apply {
+            setBackgroundColor(0xB0000000.toInt())
+            setPadding(48, 24, 48, 24)
+            visibility = View.GONE
+        }
         standby = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -62,6 +73,7 @@ class MainActivity : Activity(), Native.Sink {
             setBackgroundColor(Color.BLACK)
             addView(surface, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
             addView(standby, FrameLayout.LayoutParams(-1, -1))
+            addView(scaleHint, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         })
         render()
     }
@@ -107,7 +119,7 @@ class MainActivity : Activity(), Native.Sink {
                 showStandby(s.name, s.ip, "在 iPhone 控制中心点“屏幕镜像”，选择 ${s.name}")
             is ReceiverState.Mirroring -> {
                 standby.visibility = View.GONE
-                surface.setAspect(s.width, s.height)
+                surface.setStream(s.width, s.height, landscapeScale)
             }
             is ReceiverState.AudioOnly -> showStandby(idle.name, "正在播放 ${s.client} 的音频", "")
             is ReceiverState.Failed -> showStandby("AirScreen", "出错了", s.reason)
@@ -118,6 +130,28 @@ class MainActivity : Activity(), Native.Sink {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val s = state
+        val confirm = keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
+        if (!confirm || s !is ReceiverState.Mirroring || s.width <= 0 || s.height > s.width) {
+            return super.onKeyDown(keyCode, event)
+        }
+        if (event.repeatCount == 0) toggleLandscapeScale()
+        return true
+    }
+
+    private fun toggleLandscapeScale() {
+        landscapeScale = if (landscapeScale == ScaleMode.Fill) ScaleMode.Fit else ScaleMode.Fill
+        prefs().edit().putString(PREF_LANDSCAPE_SCALE, landscapeScale.name).apply()
+        render()
+        scaleHint.text = if (landscapeScale == ScaleMode.Fill) "填满屏幕" else "完整画面（按确认键切换）"
+        scaleHint.visibility = View.VISIBLE
+        main.removeCallbacks(hideScaleHint)
+        main.postDelayed(hideScaleHint, 1500)
+    }
+
+    private fun prefs() = getSharedPreferences("airscreen", Context.MODE_PRIVATE)
 
     private fun showStandby(titleText: String, subtitleText: String, hintText: String) {
         standby.visibility = View.VISIBLE
@@ -173,29 +207,32 @@ class MainActivity : Activity(), Native.Sink {
             !info.isEncoder && info.isHardwareAccelerated && info.supportedTypes.any { it == mime } &&
                 info.getCapabilitiesForType(mime).videoCapabilities.isSizeSupported(width, height)
         }
+
+    private companion object {
+        const val PREF_LANDSCAPE_SCALE = "landscape_scale"
+    }
 }
 
-/** SurfaceView letterboxed to the stream's aspect ratio inside its parent. */
+/** SurfaceView sized to the stream per [streamViewSize], centered by its parent; Fill overflow is clipped. */
 class AspectSurfaceView(context: Context) : SurfaceView(context) {
-    private var aspect = 0f
+    private var streamWidth = 0
+    private var streamHeight = 0
+    private var landscape = ScaleMode.Fit
 
-    fun setAspect(width: Int, height: Int) {
-        val next = if (width > 0 && height > 0) width.toFloat() / height else 0f
-        if (next != aspect) {
-            aspect = next
+    fun setStream(width: Int, height: Int, landscape: ScaleMode) {
+        if (width != streamWidth || height != streamHeight || landscape != this.landscape) {
+            streamWidth = width
+            streamHeight = height
+            this.landscape = landscape
             requestLayout()
         }
     }
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
-        val w = MeasureSpec.getSize(widthMeasureSpec)
-        val h = MeasureSpec.getSize(heightMeasureSpec)
-        if (aspect <= 0f || w == 0 || h == 0) {
-            setMeasuredDimension(w, h)
-        } else if (w > h * aspect) {
-            setMeasuredDimension((h * aspect).roundToInt(), h)
-        } else {
-            setMeasuredDimension(w, (w / aspect).roundToInt())
-        }
+        val size = streamViewSize(
+            MeasureSpec.getSize(widthMeasureSpec), MeasureSpec.getSize(heightMeasureSpec),
+            streamWidth, streamHeight, landscape,
+        )
+        setMeasuredDimension(size.width, size.height)
     }
 }
