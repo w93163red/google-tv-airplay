@@ -10,7 +10,7 @@ AirScreen 是一个运行在 Android TV 和 Google TV 上的 AirPlay 屏幕镜�
 - 遥控器：镜像时按确认键，在“智能填满”和“完整画面”之间切换。按返回键或主页键会退出应用，同时结束镜像。
 - 已知问题：部分电视在游戏模式下颜色偏艳，原因还在查。用蓝牙耳机或音箱时，画面会等声音，延迟大约 300 到 400 毫秒。不支持 AirPlay 视频链接投送（HLS）。同一时间只接收一台设备。
 
-本项目使用 GPL-3.0 许可证。AirPlay、iPhone、iPad 和 Mac 是 Apple Inc. 的商标。本项目与 Apple 没有关联，也未获得 Apple 的认可。
+本项目使用 GPL-3.0 许可证。AirPlay、iPhone、iPad 和 Mac 是 Apple Inc. 的商标。
 
 ## What it is
 
