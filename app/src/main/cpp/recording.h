@@ -28,7 +28,8 @@ typedef struct {
 
 _Static_assert(sizeof(rec_header_t) == 32, "record header layout must match across ABIs");
 
-/* Starts writing files_dir/rec-<epoch ms>.bin when the system property debug.airscreen.record is 1. */
+/* Starts writing files_dir/rec-<epoch ms>.bin when the system property debug.airscreen.record is 1.
+ * Only debug builds (AIRSCREEN_DEBUG_TOOLS) record; in release builds these do nothing and replay_start fails. */
 void recorder_open(const char *files_dir);
 void recorder_close(void);
 void recorder_write(rec_kind_t kind, const uint8_t *data, uint32_t len, uint64_t ntp_remote, uint32_t a, uint32_t b);

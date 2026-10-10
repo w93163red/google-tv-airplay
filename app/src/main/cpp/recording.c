@@ -17,6 +17,20 @@
 
 #define REPLAY_LEAD_NS 200000000LL
 
+#ifndef AIRSCREEN_DEBUG_TOOLS
+/* A recording holds the decrypted stream, so only debug builds record or replay. */
+void recorder_open(const char *files_dir) {}
+void recorder_close(void) {}
+void recorder_write(rec_kind_t kind, const uint8_t *data, uint32_t len, uint64_t ntp_remote, uint32_t a, uint32_t b) {}
+
+int replay_start(const receiver_config_t *cfg) {
+    LOGE("replay needs a debug build");
+    return -1;
+}
+
+void replay_stop(void) {}
+#else
+
 static struct {
     pthread_mutex_t lock;
     FILE *file;
@@ -177,3 +191,4 @@ void replay_stop(void) {
     for (int i = 0; i < rp.thread_count; i++) pthread_join(rp.threads[i], NULL);
     rp.thread_count = 0;
 }
+#endif

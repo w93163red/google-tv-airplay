@@ -32,5 +32,7 @@ target_compile_definitions(airscreen PRIVATE
     LIBPLIST_STATIC HAVE_STRNDUP HAVE_GMTIME_R HAVE_LOCALTIME_R HAVE_TIMEGM
     HAVE_TM_TM_GMTOFF HAVE_TM_TM_ZONE PACKAGE_VERSION="2.7.0")
 target_compile_options(airscreen PRIVATE -O2 -Wno-unused-parameter)
+# Session recording and replay (recording.c) exist only in debug builds.
+target_compile_definitions(airscreen PRIVATE $<$<CONFIG:Debug>:AIRSCREEN_DEBUG_TOOLS>)
 
 target_link_libraries(airscreen crypto_static mediandk aaudio android log)
