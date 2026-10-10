@@ -13,6 +13,7 @@ import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -44,12 +45,17 @@ class MainActivity : Activity(), Native.Sink {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Asks the TV for its low-latency (game) mode over HDMI ALLM; set once so it never flips mid-session.
+        window.attributes = window.attributes.apply { preferMinimalPostProcessing = true }
         landscapeScale = prefs().getString(PREF_LANDSCAPE_SCALE, null)
             ?.let { saved -> ScaleMode.entries.firstOrNull { it.name == saved } } ?: ScaleMode.Fill
         advertiser = ServiceAdvertiser(this)
         surface = AspectSurfaceView(this)
         surface.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) = Native.nativeSetSurface(holder.surface)
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                holder.surface.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+                Native.nativeSetSurface(holder.surface)
+            }
             override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
             override fun surfaceDestroyed(holder: SurfaceHolder) = Native.nativeSetSurface(null)
         })
