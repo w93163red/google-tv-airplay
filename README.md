@@ -2,7 +2,7 @@
 
 ## 中文说明
 
-AirScreen 是一个运行在 Android TV 和 Google TV 上的 AirPlay 屏幕镜像接收端。iPhone、iPad 或 Mac 用“屏幕镜像”把画面和声音投到电视上。
+AirScreen 是一个运行在 Android TV 和 Google TV 上的 AirPlay 屏幕镜像接收端。iPhone 或 iPad 用“屏幕镜像”把画面和声音投到电视上。Mac 走的是同一套协议，理论上可用，但还没有测试过。
 
 - 系统要求：Android 11 或更高版本，CPU 架构为 armeabi-v7a 或 arm64-v8a。
 - 安装：从 [GitHub Releases](https://github.com/w93163red/google-tv-airplay/releases) 下载 `airscreen-<版本>.apk`，用 `adb install` 安装，或者拷到电视上用文件管理器安装。
@@ -14,13 +14,13 @@ AirScreen 是一个运行在 Android TV 和 Google TV 上的 AirPlay 屏幕镜�
 
 ## What it is
 
-AirScreen is an AirPlay receiver app for Android TV and Google TV. An iPhone, iPad, or Mac mirrors its screen to the TV through **Screen Mirroring**, and the TV plays the picture and the sound.
+AirScreen is an AirPlay receiver app for Android TV and Google TV. An iPhone or iPad mirrors its screen to the TV through **Screen Mirroring**, and the TV plays the picture and the sound.
 
 It runs the AirPlay protocol code from [UxPlay](https://github.com/FDH2/UxPlay), built with the NDK. Video goes from UxPlay straight to the TV's hardware decoder through `AMediaCodec`, and audio goes out through AAudio. The app is developed on a Google TV Streamer and the Android emulator.
 
 ## Features
 
-- Screen mirroring from iPhone, iPad, and Mac. The app offers the sender the TV's display mode, for example 3840x2160 at 60 Hz, when a hardware decoder supports that size, and 1920x1080 otherwise.
+- Screen mirroring from iPhone and iPad, tested with an iPhone 15 Pro and an iPad Pro. A Mac uses the same protocol and should work, but it is untested. The app offers the sender the TV's display mode, for example 3840x2160 at 60 Hz, when a hardware decoder supports that size, and 1920x1080 otherwise.
 - H.264 and H.265 video. The app offers H.265 only when the TV has a hardware HEVC decoder.
 - AAC-ELD audio while mirroring. ALAC and AAC-LC for audio-only AirPlay, such as music.
 - Audio and video stay in sync, also over Bluetooth. Video waits for the measured latency of the audio output, Bluetooth path included. Without audio, video shows as soon as the network and the decoder allow.
