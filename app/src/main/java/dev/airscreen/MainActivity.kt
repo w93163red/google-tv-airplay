@@ -31,9 +31,8 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-class MainActivity : Activity(), Native.Sink {
+class MainActivity : Activity() {
     private val main = Handler(Looper.getMainLooper())
-    private lateinit var advertiser: ServiceAdvertiser
     private lateinit var surface: AspectSurfaceView
     private lateinit var standby: View
     private lateinit var title: TextView
@@ -42,8 +41,6 @@ class MainActivity : Activity(), Native.Sink {
     private lateinit var scaleHint: TextView
     private val hideScaleHint = Runnable { scaleHint.visibility = View.GONE }
 
-    private var state: ReceiverState = ReceiverState.Starting
-    private var idle = ReceiverState.Advertising("", "")
     private var landscapeScale = ScaleMode.Fill
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,7 +49,6 @@ class MainActivity : Activity(), Native.Sink {
         window.attributes = window.attributes.apply { preferMinimalPostProcessing = true }
         landscapeScale = prefs().getString(PREF_LANDSCAPE_SCALE, null)
             ?.let { saved -> ScaleMode.entries.firstOrNull { it.name == saved } } ?: ScaleMode.Fill
-        advertiser = ServiceAdvertiser(this)
         surface = AspectSurfaceView(this)
         surface.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) {
@@ -84,44 +80,28 @@ class MainActivity : Activity(), Native.Sink {
             addView(standby, FrameLayout.LayoutParams(-1, -1))
             addView(scaleHint, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         })
-        render()
     }
 
     override fun onStart() {
         super.onStart()
-        val name = deviceName()
-        idle = ReceiverState.Advertising(name, ipAddress())
-        Native.sink = this
-        val config = displayConfig()
-        val result = Native.nativeStart(
-            name, hwAddr(), config.width, config.height, config.refreshHz, min(config.refreshHz, 60),
-            config.avcDecoder, config.hevcDecoder, File(filesDir, "airplay.pem").path, filesDir.path, replayPath(),
-        )
-        if (result != 0) dispatch(NativeEvent.Failed("AirPlay 服务启动失败 ($result)"))
+        Receiver.onStart(this)
     }
 
     override fun onStop() {
-        Native.nativeStop()
-        Native.sink = null
-        dispatch(NativeEvent.Disconnected)
+        Receiver.onStop(this)
         super.onStop()
     }
 
-    override fun onEvent(event: NativeEvent) {
-        main.post { dispatch(event) }
+    /** Starts the native receiver configured for this activity's display; returns its status. */
+    fun startNative(): Int {
+        val config = displayConfig()
+        return Native.nativeStart(
+            deviceName(), hwAddr(), config.width, config.height, config.refreshHz, min(config.refreshHz, 60),
+            config.avcDecoder, config.hevcDecoder, File(filesDir, "airplay.pem").path, filesDir.path, replayPath(),
+        )
     }
 
-    override fun registerService(service: Int, name: String, port: Int, txt: ByteArray) =
-        advertiser.register(service, name, port, txt)
-
-    override fun unregisterService(service: Int) = advertiser.unregister(service)
-
-    private fun dispatch(event: NativeEvent) {
-        state = reduce(state, event, idle)
-        render()
-    }
-
-    private fun render() {
+    fun render(state: ReceiverState) {
         when (val s = state) {
             ReceiverState.Starting -> showStandby("AirScreen", "正在启动…", "")
             is ReceiverState.Advertising ->
@@ -130,7 +110,7 @@ class MainActivity : Activity(), Native.Sink {
                 standby.visibility = View.GONE
                 surface.setStream(s.width, s.height, landscapeScale)
             }
-            is ReceiverState.AudioOnly -> showStandby(idle.name, "正在播放 ${s.client} 的音频", "")
+            is ReceiverState.AudioOnly -> showStandby(deviceName(), "正在播放 ${s.client} 的音频", "")
             is ReceiverState.Failed -> showStandby("AirScreen", "出错了", s.reason)
         }
         if (state is ReceiverState.Mirroring) {
@@ -141,7 +121,7 @@ class MainActivity : Activity(), Native.Sink {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
-        val s = state
+        val s = Receiver.state
         val confirm = keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER
         if (!confirm || s !is ReceiverState.Mirroring || s.width <= 0 || s.height > s.width) {
             return super.onKeyDown(keyCode, event)
@@ -153,7 +133,7 @@ class MainActivity : Activity(), Native.Sink {
     private fun toggleLandscapeScale() {
         landscapeScale = if (landscapeScale == ScaleMode.Fill) ScaleMode.Fit else ScaleMode.Fill
         prefs().edit().putString(PREF_LANDSCAPE_SCALE, landscapeScale.name).apply()
-        render()
+        render(Receiver.state)
         scaleHint.text = if (landscapeScale == ScaleMode.Fill) "填满屏幕" else "完整画面（按确认键切换）"
         scaleHint.visibility = View.VISIBLE
         main.removeCallbacks(hideScaleHint)
@@ -180,10 +160,10 @@ class MainActivity : Activity(), Native.Sink {
         setPadding(0, 12, 0, 12)
     }
 
-    private fun deviceName(): String =
+    fun deviceName(): String =
         Settings.Global.getString(contentResolver, "device_name")?.takeIf { it.isNotBlank() } ?: Build.MODEL
 
-    private fun ipAddress(): String {
+    fun ipAddress(): String {
         val cm = getSystemService(ConnectivityManager::class.java)
         return cm.getLinkProperties(cm.activeNetwork)?.linkAddresses
             ?.map { it.address }?.firstOrNull { it is Inet4Address }?.hostAddress ?: "未连接网络"

@@ -41,6 +41,8 @@ sealed interface ReceiverState {
 
 The native layer emits `NativeEvent` values (client connected, codec chosen, video size, mirroring started or stopped, connection lost). A reducer `(ReceiverState, NativeEvent) -> ReceiverState` produces the next state. The UI renders the state and nothing else.
 
+The process-level `Receiver` object owns that state and the native receiver. The receiver runs while at least one `MainActivity` is started, so an instance that starts before another stops never restarts or ends a live session, and leaving the app stops it and its advertising. `MainActivity` is `singleTask`, so a launch from the launcher reaches the running instance. `scripts/relaunch-check.sh` checks both on the device.
+
 ### Native receiver config (passed once at start)
 
 ```c
