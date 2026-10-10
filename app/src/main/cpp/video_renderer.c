@@ -27,6 +27,8 @@
 #define LATENCY_SMOOTHING 16      /* frames of exponential averaging for the decode latency */
 #define FEED_AHEAD 3              /* access units fed beyond the frame due next, see head_due_locked */
 #define FEED_RECHECK_NS 20000000LL /* the due time follows the audio clock, so it is recomputed this often */
+#define ENVELOPE_RISE_NS_PER_S 5000000LL /* how fast the arrival envelope forgets an early frame */
+#define SPREAD_REFRESHES 2         /* a frame waits at most this long for a vsync of its own */
 
 typedef struct {
     int count;
@@ -54,6 +56,7 @@ static struct {
     int fed_oldest;
     video_codec_t codec;    /* written with both locks held; VIDEO_CODEC_UNKNOWN ignores pushes */
     bool resyncing;         /* overflowed: dropping until the next keyframe */
+    int64_t envelope_at;    /* arrival of the access unit that last moved arrival_envelope_ns */
     int pushed, overflowed; /* this stats window */
     samples_t push;         /* push call time */
 } q = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -66,6 +69,8 @@ static struct {
     int next_pending;
     int rendered;     /* released to the surface */
     int late;         /* decoded after their sync target */
+    int spread;       /* moved to the vsync after the previous frame's */
+    int64_t last_present_ns;
     samples_t decode; /* fed to decoded */
     samples_t glass;  /* arrival to presented */
     samples_t av;     /* audio presentation minus video presentation of the same sender time */
@@ -74,11 +79,18 @@ static struct {
 /* Smoothed fed-to-decoded time of the current decoder, 0 until its first frame. Written by the output thread. */
 static _Atomic int64_t decode_latency_ns;
 
+/* The earliest an access unit arrives relative to its sender time: the lowest arrival minus sender time,
+ * rising at ENVELOPE_RISE_NS_PER_S so clock drift and a slower network path catch up with it. Without
+ * audio, a frame is shown when it would have been decoded had it arrived on the envelope, which undoes
+ * the network's bunching. INT64_MAX before the first access unit. Written by push under q.lock. */
+static _Atomic int64_t arrival_envelope_ns = INT64_MAX;
+
 /* The feeder creates the decoder once codec, window and parameter sets are known; teardowns destroy it. */
 static struct {
     pthread_mutex_t lock;
     atomic_int teardowns; /* callers waiting for lock to change the decoder; the feeder yields to them */
     uint16_t max_width, max_height;
+    int64_t refresh_ns;
     char *avc_name, *hevc_name;
     ANativeWindow *window;
     uint8_t *params;     /* latest VPS/SPS/PPS NALs, Annex-B */
@@ -109,11 +121,16 @@ static double percentile_ms(samples_t *s, int pct) {
     return s->us[(s->count * pct) / 100] / 1000.0;
 }
 
-/* When audio plays the sender time remote, by the averaged audio offset so the schedule does not
- * jitter, and never more than MAX_SYNC_DELAY_NS after arrival. 0 when no audio is playing. */
-static int64_t sync_target_ns(int64_t arrival_ns, uint64_t remote, int64_t *audio_offset) {
-    int64_t smoothed;
-    if (!remote || !audio_renderer_offset(audio_offset, &smoothed)) return 0;
+/* When to show the frame with sender time remote. While audio plays: when audio plays that sender
+ * time, by the averaged audio offset so the schedule does not jitter, and never more than
+ * MAX_SYNC_DELAY_NS after arrival. Otherwise: by the arrival envelope plus the decode latency.
+ * 0 when the sender time is unknown. */
+static int64_t sync_target_ns(int64_t arrival_ns, uint64_t remote) {
+    int64_t latest_audio, smoothed, envelope = atomic_load(&arrival_envelope_ns);
+    if (!remote || envelope == INT64_MAX) return 0;
+    if (!audio_renderer_offset(&latest_audio, &smoothed)) {
+        return (int64_t) remote + envelope + atomic_load(&decode_latency_ns);
+    }
     int64_t target = (int64_t) remote + smoothed, latest = arrival_ns + MAX_SYNC_DELAY_NS;
     return target > latest ? latest : target;
 }
@@ -121,13 +138,13 @@ static int64_t sync_target_ns(int64_t arrival_ns, uint64_t remote, int64_t *audi
 /* When the head access unit goes to the decoder: the decode latency plus a margin before its sync
  * target. The MediaTek decoders emit a frame only after one to three later access units are fed, so
  * it also goes no later than a margin before the target of the access unit FEED_AHEAD before it.
- * 0 when no audio plays. */
+ * 0 when the sender time is unknown. */
 static int64_t head_due_locked(void) {
     const access_unit_t *head = &q.slots[q.head], *ahead = &q.fed[q.fed_oldest];
-    int64_t audio_offset, target = sync_target_ns(head->arrival_ns, head->ntp_remote, &audio_offset);
+    int64_t target = sync_target_ns(head->arrival_ns, head->ntp_remote);
     if (!target) return 0;
     int64_t due = target - atomic_load(&decode_latency_ns) - FEED_MARGIN_NS;
-    int64_t ahead_target = sync_target_ns(ahead->arrival_ns, ahead->ntp_remote, &audio_offset);
+    int64_t ahead_target = sync_target_ns(ahead->arrival_ns, ahead->ntp_remote);
     return ahead_target && ahead_target - FEED_MARGIN_NS < due ? ahead_target - FEED_MARGIN_NS : due;
 }
 
@@ -140,25 +157,33 @@ static void remember_frame(int64_t pts_us, uint64_t remote_ns, int64_t fed_ns) {
     pthread_mutex_unlock(&t.lock);
 }
 
-/* When to show a decoded frame (pts_us is its local arrival time): its sync target, or now when
- * that has passed or no audio is playing. Updates the decode latency and records the frame's stats. */
+/* When to show a decoded frame (pts_us is its local arrival time): its sync target, or now when that
+ * has passed. Two frames for one vsync would show only the second, so a frame that would follow the
+ * previous one within a refresh waits for the next vsync instead, by at most SPREAD_REFRESHES.
+ * Updates the decode latency and records the frame's stats. */
 static int64_t schedule_frame(int64_t pts_us, int64_t decoded_ns) {
     int64_t present_ns = decoded_ns;
+    int64_t remote = 0;
     pthread_mutex_lock(&t.lock);
     for (int i = 0; i < PENDING_SLOTS; i++) {
         if (t.pending[i].pts_us != pts_us) continue;
-        int64_t audio_offset, remote = (int64_t) t.pending[i].remote_ns;
-        int64_t target = sync_target_ns(pts_us * 1000, (uint64_t) remote, &audio_offset);
-        if (target) {
-            if (target > decoded_ns) present_ns = target;
-            else t.late++;
-            add_sample(&t.av, (remote + audio_offset - present_ns) / 1000);
-        }
+        remote = (int64_t) t.pending[i].remote_ns;
+        int64_t target = sync_target_ns(pts_us * 1000, (uint64_t) remote);
+        if (target > decoded_ns) present_ns = target;
+        else if (target) t.late++;
         int64_t latency = decoded_ns - t.pending[i].fed_ns, smoothed = atomic_load(&decode_latency_ns);
         atomic_store(&decode_latency_ns, smoothed ? smoothed + (latency - smoothed) / LATENCY_SMOOTHING : latency);
         add_sample(&t.decode, latency / 1000);
         break;
     }
+    int64_t next_vsync = t.last_present_ns + v.refresh_ns;
+    if (present_ns < next_vsync - v.refresh_ns / 32 && next_vsync <= present_ns + SPREAD_REFRESHES * v.refresh_ns) {
+        present_ns = next_vsync;
+        t.spread++;
+    }
+    t.last_present_ns = present_ns;
+    int64_t audio_offset, smoothed;
+    if (remote && audio_renderer_offset(&audio_offset, &smoothed)) add_sample(&t.av, (remote + audio_offset - present_ns) / 1000);
     t.rendered++;
     add_sample(&t.glass, present_ns / 1000 - pts_us);
     pthread_mutex_unlock(&t.lock);
@@ -172,18 +197,18 @@ static void log_stats(void) {
     q.pushed = q.overflowed = q.push.count = 0;
     pthread_mutex_unlock(&q.lock);
     pthread_mutex_lock(&t.lock);
-    int rendered = t.rendered, late = t.late;
+    int rendered = t.rendered, late = t.late, spread = t.spread;
     samples_t decode = t.decode, glass = t.glass, av = t.av;
-    t.rendered = t.late = 0;
+    t.rendered = t.late = t.spread = 0;
     t.decode.count = t.glass.count = t.av.count = 0;
     pthread_mutex_unlock(&t.lock);
     double av_p50 = percentile_ms(&av, 50);
     for (int i = 0; i < av.count; i++) av.us[i] = llabs(av.us[i]);
     __android_log_print(ANDROID_LOG_INFO, STATS_TAG,
-                        "pushed=%d in=%d rendered=%d late=%d dropped=%d overflow=%d push_ms p50=%.2f p99=%.2f "
+                        "pushed=%d in=%d rendered=%d late=%d spread=%d dropped=%d overflow=%d push_ms p50=%.2f p99=%.2f "
                         "decode_ms p50=%.1f p99=%.1f lead=%.1f glass_ms p50=%.1f p99=%.1f "
                         "av_offset_ms n=%d p50=%.1f abs_p99=%.1f",
-                        pushed, atomic_exchange(&v.frames_in, 0), rendered, late, atomic_exchange(&v.frames_dropped, 0),
+                        pushed, atomic_exchange(&v.frames_in, 0), rendered, late, spread, atomic_exchange(&v.frames_dropped, 0),
                         overflowed, percentile_ms(&push, 50), percentile_ms(&push, 99),
                         percentile_ms(&decode, 50), percentile_ms(&decode, 99),
                         (atomic_load(&decode_latency_ns) + FEED_MARGIN_NS) / 1e6,
@@ -437,6 +462,7 @@ static void restart_locked(video_codec_t codec) {
     q.head = q.count = 0;
     q.resyncing = false;
     memset(q.fed, 0, sizeof(q.fed));
+    atomic_store(&arrival_envelope_ns, INT64_MAX);
     pthread_mutex_unlock(&q.lock);
 }
 
@@ -446,6 +472,7 @@ void video_renderer_init(const receiver_config_t *cfg) {
     pthread_mutex_lock(&v.lock);
     v.max_width = cfg->width;
     v.max_height = cfg->height;
+    v.refresh_ns = 1000000000LL / (cfg->refresh_hz ? cfg->refresh_hz : 60);
     free(v.avc_name);
     free(v.hevc_name);
     v.avc_name = cfg->avc_decoder ? strdup(cfg->avc_decoder) : NULL;
@@ -512,6 +539,13 @@ void video_renderer_push(const uint8_t *data, int len, uint64_t ntp_remote) {
         au->arrival_ns = arrival_ns;
         au->ntp_remote = ntp_remote;
         au->keyframe = keyframe;
+        if (ntp_remote) {
+            int64_t envelope = atomic_load(&arrival_envelope_ns), lag = arrival_ns - (int64_t) ntp_remote;
+            if (envelope != INT64_MAX) envelope += (arrival_ns - q.envelope_at) / 1000 * ENVELOPE_RISE_NS_PER_S / 1000000;
+            if (lag < envelope) envelope = lag;
+            atomic_store(&arrival_envelope_ns, envelope);
+            q.envelope_at = arrival_ns;
+        }
         wake = q.count++ == 0;
         q.resyncing = false;
         q.pushed++;
