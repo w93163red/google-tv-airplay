@@ -1,7 +1,9 @@
+#include <android/native_window_jni.h>
 #include <jni.h>
 #include <pthread.h>
 
 #include "airscreen.h"
+#include "video_renderer.h"
 
 static JavaVM *vm;
 static jclass native_class;
@@ -89,4 +91,11 @@ Java_dev_airscreen_Native_nativeStart(JNIEnv *env, jclass cls, jstring name, jby
 JNIEXPORT void JNICALL
 Java_dev_airscreen_Native_nativeStop(JNIEnv *env, jclass cls) {
     receiver_stop();
+}
+
+JNIEXPORT void JNICALL
+Java_dev_airscreen_Native_nativeSetSurface(JNIEnv *env, jclass cls, jobject surface) {
+    ANativeWindow *window = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
+    video_renderer_set_window(window);
+    if (window) ANativeWindow_release(window);
 }

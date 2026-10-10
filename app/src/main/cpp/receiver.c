@@ -9,6 +9,8 @@
 #include "raop.h"
 
 #include "airscreen.h"
+#include "audio_renderer.h"
+#include "video_renderer.h"
 
 #define TAG "AirScreen"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -30,6 +32,7 @@ static struct {
     bool reset_requested;
     int open_connections;
     int missed_feedback;
+    float volume_db;
     char client[128];
 } r = { .lock = PTHREAD_MUTEX_INITIALIZER, .wake = PTHREAD_COND_INITIALIZER };
 
@@ -57,6 +60,8 @@ static void conn_destroy(void *cls) {
     bool last = --r.open_connections == 0;
     pthread_mutex_unlock(&r.lock);
     if (last) {
+        video_renderer_reset();
+        audio_renderer_stop();
         bridge_emit(EVENT_DISCONNECTED, NULL, 0, 0);
     }
 }
@@ -83,17 +88,20 @@ static void report_client_request(void *cls, char *deviceid, char *model, char *
 static int video_set_codec(void *cls, video_codec_t codec) {
     char client[sizeof(r.client)];
     current_client(client, sizeof(client));
+    video_renderer_set_codec(codec);
     bridge_emit(EVENT_MIRROR_STARTED, client, codec, 0);
     return 0;
 }
 
 static void video_process(void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
+    video_renderer_push(data->data, data->data_len);
 }
 
 static void video_reset(void *cls, reset_type_t type) {
     if (type == RESET_TYPE_ON_VIDEO_PLAY) {
         return;
     }
+    video_renderer_reset();
     bridge_emit(EVENT_MIRROR_STOPPED, NULL, 0, 0);
 }
 
@@ -106,6 +114,7 @@ static void video_resume(void *cls) {
 static void audio_get_format(void *cls, unsigned char *ct, unsigned short *spf, bool *using_screen,
                              bool *is_media, uint64_t *audio_format) {
     LOGI("audio format ct=%d spf=%d usingScreen=%d isMedia=%d", *ct, *spf, *using_screen, *is_media);
+    audio_renderer_start(*ct, *spf);
     if (!*using_screen) {
         char client[sizeof(r.client)];
         current_client(client, sizeof(client));
@@ -114,13 +123,25 @@ static void audio_get_format(void *cls, unsigned char *ct, unsigned short *spf, 
 }
 
 static void audio_process(void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
+    audio_renderer_push(data->data, data->data_len);
+}
+
+static void audio_flush(void *cls) {
+    audio_renderer_flush();
 }
 
 static double audio_set_client_volume(void *cls) {
-    return 0.0;
+    pthread_mutex_lock(&r.lock);
+    double volume = r.volume_db;
+    pthread_mutex_unlock(&r.lock);
+    return volume;
 }
 
 static void audio_set_volume(void *cls, float volume) {
+    pthread_mutex_lock(&r.lock);
+    r.volume_db = volume;
+    pthread_mutex_unlock(&r.lock);
+    audio_renderer_set_volume(volume);
 }
 
 static void log_callback(void *cls, int level, const char *msg) {
@@ -133,6 +154,8 @@ static void log_callback(void *cls, int level, const char *msg) {
 /* What UxPlay's main loop does after conn_reset: drop every connection and restart the httpd. */
 static void reset_connections(void) {
     raop_stop_httpd(r.raop);
+    audio_renderer_stop();
+    video_renderer_reset();
     raop_remove_known_connections(r.raop);
     unsigned short port = raop_get_port(r.raop);
     raop_start_httpd(r.raop, &port);
@@ -169,6 +192,7 @@ static void *control_loop(void *arg) {
 
 int receiver_start(const receiver_config_t *cfg) {
     int err = 0;
+    video_renderer_init(cfg->width, cfg->height);
     r.dnssd = dnssd_init(cfg->name, (int) strlen(cfg->name), (const char *) cfg->hw_addr,
                          sizeof(cfg->hw_addr), 0, &err);
     if (!r.dnssd) {
@@ -192,6 +216,7 @@ int receiver_start(const receiver_config_t *cfg) {
         .video_resume = video_resume,
         .audio_get_format = audio_get_format,
         .audio_process = audio_process,
+        .audio_flush = audio_flush,
         .audio_set_client_volume = audio_set_client_volume,
         .audio_set_volume = audio_set_volume,
     };
@@ -267,4 +292,6 @@ void receiver_stop(void) {
         dnssd_destroy(r.dnssd);
         r.dnssd = NULL;
     }
+    video_renderer_reset();
+    audio_renderer_stop();
 }

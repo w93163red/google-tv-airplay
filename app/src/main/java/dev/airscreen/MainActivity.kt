@@ -12,6 +12,7 @@ import android.os.Looper
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
@@ -41,6 +42,11 @@ class MainActivity : Activity(), Native.Sink {
         super.onCreate(savedInstanceState)
         advertiser = ServiceAdvertiser(this)
         surface = AspectSurfaceView(this)
+        surface.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) = Native.nativeSetSurface(holder.surface)
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) = Native.nativeSetSurface(null)
+        })
         title = text(40f)
         subtitle = text(22f)
         hint = text(22f)

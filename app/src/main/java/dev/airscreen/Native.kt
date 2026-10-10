@@ -30,6 +30,10 @@ object Native {
     @JvmStatic
     external fun nativeStop()
 
+    /** Null when the surface is destroyed; must return before surfaceDestroyed does. */
+    @JvmStatic
+    external fun nativeSetSurface(surface: Surface?)
+
     @JvmStatic
     fun onEvent(kind: Int, text: String?, a: Int, b: Int) {
         sink?.onEvent(NativeEvent.fromNative(kind, text, a, b))
